@@ -17,6 +17,7 @@
     "aftertouch": true,
     "chainable": true,
     "component_type": "sound_generator",
+    "default_forward_channel": -2,
     "chain_params": [
       {
         "key": "preset",
