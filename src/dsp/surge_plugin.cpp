@@ -438,7 +438,7 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
      * lookups (like ~/.Surge XT and ~/.local/share/...) go to writable dirs. */
     char surge_home_path[512];
     snprintf(surge_home_path, sizeof(surge_home_path),
-             "/data/UserData/move-anything/surge-config");
+             "/data/UserData/schwung/surge-config");
     setenv("HOME", surge_home_path, 1);
     setenv("XDG_DATA_HOME", surge_home_path, 1);
     snprintf(msg, sizeof(msg), "Set HOME and XDG_DATA_HOME=%s", surge_home_path);
