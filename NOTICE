@@ -1,0 +1,14 @@
+schwung-surge
+=============
+
+This module includes **Surge XT** (hybrid synthesizer) by the Surge
+Synth Team — https://github.com/surge-synthesizer/surge — and is
+distributed under the terms of the GNU General Public License, version 3
+or later (GPL-3.0-or-later). The full text of the GPL-3 is in the
+LICENSE file.
+
+Schwung integration by Charles Vestal.
+
+See upstream project for original copyright, authorship, contributor
+list, and detailed DSP attribution. All oscillator models, filter
+designs, factory presets, and effects are derived from upstream Surge XT.

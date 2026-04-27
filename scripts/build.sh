@@ -63,6 +63,8 @@ mkdir -p dist/surge
 # Copy files to dist
 cat src/module.json > dist/surge/module.json
 [ -f src/help.json ] && cat src/help.json > dist/surge/help.json
+[ -f LICENSE ] && cat LICENSE > dist/surge/LICENSE
+[ -f NOTICE ]  && cat NOTICE  > dist/surge/NOTICE
 cat src/ui.js > dist/surge/ui.js
 cat build/dsp.so > dist/surge/dsp.so
 chmod +x dist/surge/dsp.so
