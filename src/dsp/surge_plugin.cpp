@@ -15,6 +15,10 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <algorithm>
+#include <cctype>
+#include <vector>
+#include <map>
 
 /* Plugin API definitions */
 extern "C" {
@@ -112,6 +116,14 @@ typedef struct {
     surge_param_entry params[MAX_SURGE_PARAMS];
     int param_count;
 
+    /* Patch Categories */
+    std::map<int, std::string> *category_id_to_name;
+    struct category_entry {
+        char name[64];
+        int first_idx;
+    };
+    std::vector<category_entry> *categories;
+
     /* Pre-built JSON strings */
     char *ui_hierarchy_json;
     char *chain_params_json;
@@ -186,6 +198,105 @@ static void populate_param_registry(surge_instance_t *inst) {
     plugin_log(msg);
 }
 
+/* =====================================================================
+ * Category helpers
+ * ===================================================================== */
+
+static void find_category_names_recursive(const std::vector<PatchCategory> &cats, std::map<int, std::string> &map) {
+    for (const auto &cat : cats) {
+        map[cat.internalid] = cat.name;
+        if (!cat.children.empty()) {
+            find_category_names_recursive(cat.children, map);
+        }
+    }
+}
+
+static void update_category_list(surge_instance_t *inst) {
+    if (!inst->synth || !inst->category_id_to_name || !inst->categories) return;
+
+    auto &storage = inst->synth->storage;
+    inst->category_id_to_name->clear();
+    find_category_names_recursive(storage.patch_category, *inst->category_id_to_name);
+
+    /* Sort patchOrdering by category then name */
+    std::sort(storage.patchOrdering.begin(), storage.patchOrdering.end(), [&](int a, int b) {
+        if (a < 0 || a >= (int)storage.patch_list.size()) return false;
+        if (b < 0 || b >= (int)storage.patch_list.size()) return true;
+
+        const auto &pa = storage.patch_list[a];
+        const auto &pb = storage.patch_list[b];
+
+        auto get_cat = [&](int id) {
+            auto it = inst->category_id_to_name->find(id);
+            /* Use a prefix that sorts "Unknown" to the end ({ is after Z in ASCII) */
+            return (it != inst->category_id_to_name->end()) ? it->second : std::string("{Unknown}");
+        };
+
+        std::string catA = get_cat(pa.category);
+        std::string catB = get_cat(pb.category);
+
+        auto compare_ci = [](const std::string& s1, const std::string& s2) {
+            return std::lexicographical_compare(
+                s1.begin(), s1.end(), s2.begin(), s2.end(),
+                [](unsigned char c1, unsigned char c2) { return std::tolower(c1) < std::tolower(c2); }
+            );
+        };
+
+        if (catA != catB) {
+            bool a_less_b = compare_ci(catA, catB);
+            bool b_less_a = compare_ci(catB, catA);
+            if (a_less_b || b_less_a) return a_less_b;
+        }
+        return compare_ci(pa.name, pb.name);
+    });
+
+    inst->categories->clear();
+    std::string last_cat_name = "";
+
+    for (int i = 0; i < (int)storage.patchOrdering.size(); i++) {
+        int patch_idx = storage.patchOrdering[i];
+        if (patch_idx < 0 || patch_idx >= (int)storage.patch_list.size()) continue;
+
+        int cat_id = storage.patch_list[patch_idx].category;
+        std::string cat_name = "Unknown";
+        auto it = inst->category_id_to_name->find(cat_id);
+        if (it != inst->category_id_to_name->end()) {
+            cat_name = it->second;
+        }
+
+        if (cat_name != last_cat_name) {
+            surge_instance_t::category_entry entry;
+            strncpy(entry.name, cat_name.c_str(), sizeof(entry.name) - 1);
+            entry.name[sizeof(entry.name) - 1] = '\0';
+            entry.first_idx = i;
+            inst->categories->push_back(entry);
+            last_cat_name = cat_name;
+        }
+    }
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Found %d patch categories", (int)inst->categories->size());
+    plugin_log(msg);
+}
+
+static const char* get_current_preset_category(surge_instance_t *inst) {
+    if (!inst->synth || inst->current_preset < 0) return "Unknown";
+
+    auto &storage = inst->synth->storage;
+    if (inst->current_preset >= (int)storage.patchOrdering.size()) return "Unknown";
+
+    int patch_idx = storage.patchOrdering[inst->current_preset];
+    int cat_id = storage.patch_list[patch_idx].category;
+
+    if (inst->category_id_to_name) {
+        auto it = inst->category_id_to_name->find(cat_id);
+        if (it != inst->category_id_to_name->end()) {
+            return it->second.c_str();
+        }
+    }
+    return "Unknown";
+}
+
 /* Find a parameter entry by key */
 static surge_param_entry* find_param(surge_instance_t *inst, const char *key) {
     for (int i = 0; i < inst->param_count; i++) {
@@ -251,6 +362,7 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                 "\"knobs\":[\"filter1_cutoff\",\"filter1_resonance\",\"filter1_envmod\","
                     "\"env1_attack\",\"env1_decay\",\"env1_sustain\",\"env1_release\",\"volume\"],"
                 "\"params\":["
+                    "{\"level\":\"category_jump\",\"label\":\"Jump to Category\"},"
                     "{\"level\":\"osc1\",\"label\":\"Oscillator 1\"},"
                     "{\"level\":\"osc2\",\"label\":\"Oscillator 2\"},"
                     "{\"level\":\"osc3\",\"label\":\"Oscillator 3\"},"
@@ -265,6 +377,15 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                     "{\"level\":\"scene\",\"label\":\"Scene\"},"
                     "{\"level\":\"mpe\",\"label\":\"MPE\"}"
                 "]"
+            "},"
+            "\"category_jump\":{"
+                "\"label\":\"Jump to Category\","
+                "\"items_param\":\"category_list\","
+                "\"select_param\":\"jump_to_category\","
+                "\"navigate_to\":\"root\","
+                "\"children\":null,"
+                "\"knobs\":[],"
+                "\"params\":[]"
             "},"
             "\"osc1\":{"
                 "\"children\":null,"
@@ -492,6 +613,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     /* Build parameter registry */
     populate_param_registry(inst);
 
+    /* Category handling */
+    inst->category_id_to_name = new std::map<int, std::string>();
+    inst->categories = new std::vector<surge_instance_t::category_entry>();
+    update_category_list(inst);
+
     /* Count available patches (using sorted ordering) */
     inst->preset_count = (int)inst->synth->storage.patchOrdering.size();
     if (inst->preset_count > 0) {
@@ -502,8 +628,8 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     build_ui_hierarchy(inst);
     build_chain_params(inst);
 
-    snprintf(msg, sizeof(msg), "Instance created: %d patches, %d params",
-             inst->preset_count, inst->param_count);
+    snprintf(msg, sizeof(msg), "Instance created: %d patches, %d categories, %d params",
+             inst->preset_count, (int)inst->categories->size(), inst->param_count);
     plugin_log(msg);
 
     return inst;
@@ -515,6 +641,8 @@ static void v2_destroy_instance(void *instance) {
 
     free(inst->ui_hierarchy_json);
     free(inst->chain_params_json);
+    delete inst->categories;
+    delete inst->category_id_to_name;
     delete inst->synth;
     delete inst->plugin_layer;
     free(inst);
@@ -645,6 +773,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(key, "jump_to_category") == 0) {
+        int idx = atoi(val);
+        if (inst->categories && idx >= 0 && idx < (int)inst->categories->size()) {
+            load_preset_by_display_index(inst, (*inst->categories)[idx].first_idx);
+        }
+        return;
+    }
+
+
     /* Generic Surge parameter access */
     surge_param_entry *entry = find_param(inst, key);
     if (entry) {
@@ -674,6 +811,33 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->synth ? (int)inst->synth->mpeEnabled : 0);
     if (strcmp(key, "mpe_pitch_bend_range") == 0)
         return snprintf(buf, buf_len, "%d", inst->synth ? (int)inst->synth->storage.mpePitchBendRange : 48);
+
+    if (strcmp(key, "category_list") == 0) {
+        if (!inst->categories) return snprintf(buf, buf_len, "[]");
+        std::string json = "[";
+        for (size_t i = 0; i < inst->categories->size(); i++) {
+            if (i > 0) json += ",";
+            json += "{\"index\":" + std::to_string(i) + ",\"label\":\"";
+            for (const char *p = (*inst->categories)[i].name; *p; p++) {
+                if (*p == '"' || *p == '\\') {
+                    json += '\\';
+                }
+                json += *p;
+            }
+            json += "\"}";
+        }
+        json += "]";
+        int len = (int)json.size();
+        if (len < buf_len) {
+            strcpy(buf, json.c_str());
+            return len;
+        }
+        return -1;
+    }
+
+    if (strcmp(key, "bank_name") == 0) {
+        return snprintf(buf, buf_len, "%s", get_current_preset_category(inst));
+    }
 
     /* State serialization — includes all registered params for full save/restore */
     if (strcmp(key, "state") == 0) {
