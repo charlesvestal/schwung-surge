@@ -73,7 +73,11 @@ target_link_libraries(surge-move-plugin PRIVATE
 
 # Statically link libstdc++ - the Move device has GLIBCXX up to 3.4.29
 # but Surge's C++20 code requires 3.4.30+
-target_link_options(surge-move-plugin PRIVATE -static-libstdc++ -static-libgcc)
+target_link_options(surge-move-plugin PRIVATE
+    -static-libstdc++
+    -static-libgcc
+    -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/plugin.lds
+)
 
 # Output as dsp.so
 set_target_properties(surge-move-plugin PROPERTIES
