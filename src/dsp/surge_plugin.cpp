@@ -96,6 +96,7 @@ struct surge_param_entry {
     float min_val;
     float max_val;
     char options_json[4096];
+    int param_id_in_scene;
 };
 
 /* =====================================================================
@@ -107,10 +108,12 @@ typedef struct {
     int source_idx;
     int dest_idx;
     float amount;
+    bool is_active;
     long active_ptag;
     int active_modsource;
-    bool is_active;
 } surge_mod_slot;
+
+#define NUM_MOD_SLOTS 6
 
 typedef struct {
     char module_dir[256];
@@ -129,7 +132,7 @@ typedef struct {
     surge_param_entry params[MAX_SURGE_PARAMS];
     int param_count;
 
-    surge_mod_slot mod_slots[16];
+    surge_mod_slot mod_slots[NUM_MOD_SLOTS];
 
     /* Patch Categories */
     std::map<int, std::string> *category_id_to_name;
@@ -207,7 +210,18 @@ static void populate_param_registry(surge_instance_t *inst) {
         entry->min_val = (p->valtype == 2) ? p->val_min.f : (float)p->val_min.i;
         entry->max_val = (p->valtype == 2) ? p->val_max.f : (float)p->val_max.i;
         entry->options_json[0] = '\0';
-        if ((p->valtype == 0 || p->valtype == 1) && p->ctrltype != ct_filtersubtype) {
+        entry->param_id_in_scene = p->param_id_in_scene;
+                if (strcmp(entry->key, "ws_type") == 0) {
+            std::string opts = "[";
+            opts += "\"Off\",\"Soft\",\"Hard\",\"Asymmetric\",\"Sine\",\"Digital\",\"OJD\",\"Fuzz\",\"Fuzz+Octave\",";
+            opts += "\"K35\",\"Distortion\",\"Distortion+Asym\",\"Tube\",\"Tube2\",\"Clip\",\"Fold\",\"Waveshaper\",\"S-Curve\",";
+            opts += "\"Sinusoid\",\"Chebyshev\",\"Chebyshev2\",\"Chebyshev3\",\"Chebyshev4\",\"Chebyshev5\",\"Chebyshev6\",";
+            opts += "\"Symmetric Clip\",\"Symmetric Fold\",\"Asymmetric Clip\",\"Asymmetric Fold\",\"Soft Clip\",\"Soft Fold\",";
+            opts += "\"Hard Clip\",\"Hard Fold\",\"Wavefolder\",\"Wavefolder 2\",\"Wavefolder 3\",\"Wavefolder 4\",\"Wavefolder 5\",";
+            opts += "\"Wavefolder 6\",\"Bitcrusher\",\"Bitcrusher 2\",\"Sample & Hold\",\"Decimator\",\"Slew Rate Limiter\"";
+            opts += "]";
+            strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
+        } else if ((p->valtype == 0 || p->valtype == 1) && p->ctrltype != ct_filtersubtype) {
             int min_val = p->val_min.i;
             int max_val = p->val_max.i;
             if (max_val > min_val && max_val - min_val < 128) {
@@ -371,6 +385,63 @@ static void load_preset_by_display_index(surge_instance_t *inst, int display_idx
 
     /* Re-populate parameter registry (param IDs may shift after patch load) */
     populate_param_registry(inst);
+
+    for (int i = 0; i < NUM_MOD_SLOTS; i++) {
+        inst->mod_slots[i].enabled = false;
+        inst->mod_slots[i].source_idx = 0;
+        inst->mod_slots[i].dest_idx = 0;
+        inst->mod_slots[i].amount = 0.0f;
+        inst->mod_slots[i].is_active = false;
+    }
+
+    int slot_idx = 0;
+    const std::vector<ModulationRouting> *mod_lists[] = {
+        &patch.scene[0].modulation_voice,
+        &patch.scene[0].modulation_scene,
+        &patch.modulation_global
+    };
+
+    for (int L = 0; L < 3 && slot_idx < NUM_MOD_SLOTS; L++) {
+        for (const auto &mr : *mod_lists[L]) {
+            if (mr.depth != 0.0f && !mr.muted) {
+                int dest_idx = 0;
+                for (int p = 0; p < inst->param_count; p++) {
+                    long target_id = (L == 2) ? inst->params[p].surge_id.getSynthSideId() : inst->params[p].param_id_in_scene;
+                    if (target_id == mr.destination_id) {
+                        dest_idx = p + 1;
+                        break;
+                    }
+                }
+                if (dest_idx > 0) {
+                    inst->mod_slots[slot_idx].enabled = true;
+                    inst->mod_slots[slot_idx].source_idx = mr.source_id;
+                    inst->mod_slots[slot_idx].dest_idx = dest_idx;
+                    
+                    long ptag = inst->params[dest_idx - 1].surge_id.getSynthSideId();
+                    if (ptag >= 0 && ptag < (long)inst->synth->storage.getPatch().param_ptr.size()) {
+                        Parameter* param = inst->synth->storage.getPatch().param_ptr[ptag];
+                        if (param) {
+                            float val_range = param->val_max.f - param->val_min.f;
+                            float norm = (val_range > 0) ? (mr.depth / val_range) : 0.0f;
+                            if (norm < -1.0f) norm = -1.0f;
+                            if (norm > 1.0f) norm = 1.0f;
+                            inst->mod_slots[slot_idx].amount = norm;
+                        } else {
+                            inst->mod_slots[slot_idx].amount = mr.depth;
+                        }
+                    } else {
+                        inst->mod_slots[slot_idx].amount = mr.depth;
+                    }
+                    
+                    inst->mod_slots[slot_idx].is_active = true;
+                    inst->mod_slots[slot_idx].active_ptag = mr.destination_id;
+                    inst->mod_slots[slot_idx].active_modsource = mr.source_id;
+                    slot_idx++;
+                    if (slot_idx >= NUM_MOD_SLOTS) break;
+                }
+            }
+        }
+    }
 }
 
 /* =====================================================================
@@ -406,34 +477,30 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                     "{\"level\":\"osc2\",\"label\":\"Oscillator 2\"},"
                     "{\"level\":\"osc3\",\"label\":\"Oscillator 3\"},"
                     "{\"level\":\"mixer\",\"label\":\"Mixer\"},"
+                    "{\"level\":\"scene\",\"label\":\"Scene\"},"
                     "{\"level\":\"filter1\",\"label\":\"Filter 1\"},"
                     "{\"level\":\"filter2\",\"label\":\"Filter 2\"},"
                     "{\"level\":\"amp_env\",\"label\":\"Amp Envelope\"},"
                     "{\"level\":\"filt_env\",\"label\":\"Filter Envelope\"},"
+                    "{\"level\":\"mpe\",\"label\":\"MPE\"},"
                     "{\"level\":\"lfo1\",\"label\":\"LFO 1\"},"
                     "{\"level\":\"lfo2\",\"label\":\"LFO 2\"},"
                     "{\"level\":\"lfo3\",\"label\":\"LFO 3\"},"
                     "{\"level\":\"lfo4\",\"label\":\"LFO 4\"},"
                     "{\"level\":\"lfo5\",\"label\":\"LFO 5\"},"
                     "{\"level\":\"lfo6\",\"label\":\"LFO 6\"},"
-                    "{\"level\":\"scene\",\"label\":\"Scene\"},"
-                    "{\"level\":\"mpe\",\"label\":\"MPE\"},"
+                    "{\"level\":\"slfo1\",\"label\":\"Scene LFO 1\"},"
+                    "{\"level\":\"slfo2\",\"label\":\"Scene LFO 2\"},"
+                    "{\"level\":\"slfo3\",\"label\":\"Scene LFO 3\"},"
+                    "{\"level\":\"slfo4\",\"label\":\"Scene LFO 4\"},"
+                    "{\"level\":\"slfo5\",\"label\":\"Scene LFO 5\"},"
+                    "{\"level\":\"slfo6\",\"label\":\"Scene LFO 6\"},"
                     "{\"level\":\"mod_0\",\"label\":\"Mod Slot 1\"},"
                     "{\"level\":\"mod_1\",\"label\":\"Mod Slot 2\"},"
                     "{\"level\":\"mod_2\",\"label\":\"Mod Slot 3\"},"
                     "{\"level\":\"mod_3\",\"label\":\"Mod Slot 4\"},"
                     "{\"level\":\"mod_4\",\"label\":\"Mod Slot 5\"},"
-                    "{\"level\":\"mod_5\",\"label\":\"Mod Slot 6\"},"
-                    "{\"level\":\"mod_6\",\"label\":\"Mod Slot 7\"},"
-                    "{\"level\":\"mod_7\",\"label\":\"Mod Slot 8\"},"
-                    "{\"level\":\"mod_8\",\"label\":\"Mod Slot 9\"},"
-                    "{\"level\":\"mod_9\",\"label\":\"Mod Slot 10\"},"
-                    "{\"level\":\"mod_10\",\"label\":\"Mod Slot 11\"},"
-                    "{\"level\":\"mod_11\",\"label\":\"Mod Slot 12\"},"
-                    "{\"level\":\"mod_12\",\"label\":\"Mod Slot 13\"},"
-                    "{\"level\":\"mod_13\",\"label\":\"Mod Slot 14\"},"
-                    "{\"level\":\"mod_14\",\"label\":\"Mod Slot 15\"},"
-                    "{\"level\":\"mod_15\",\"label\":\"Mod Slot 16\"}"
+                    "{\"level\":\"mod_5\",\"label\":\"Mod Slot 6\"}"
                 "]"
             "},"
             "\"category_jump\":{"
@@ -566,6 +633,60 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                     "\"lfo5_delay\",\"lfo5_attack\",\"lfo5_hold\","
                     "\"lfo5_decay\",\"lfo5_sustain\",\"lfo5_release\"]"
             "},"
+            "\"slfo1\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo6_shape\",\"lfo6_rate\",\"lfo6_magnitude\",\"lfo6_deform\","
+                    "\"lfo6_phase\",\"lfo6_delay\",\"lfo6_attack\",\"lfo6_decay\"],"
+                "\"params\":[\"lfo6_shape\",\"lfo6_rate\",\"lfo6_phase\",\"lfo6_magnitude\","
+                    "\"lfo6_deform\",\"lfo6_trigmode\",\"lfo6_unipolar\","
+                    "\"lfo6_delay\",\"lfo6_attack\",\"lfo6_hold\","
+                    "\"lfo6_decay\",\"lfo6_sustain\",\"lfo6_release\"]"
+            "},"
+            "\"slfo2\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo7_shape\",\"lfo7_rate\",\"lfo7_magnitude\",\"lfo7_deform\","
+                    "\"lfo7_phase\",\"lfo7_delay\",\"lfo7_attack\",\"lfo7_decay\"],"
+                "\"params\":[\"lfo7_shape\",\"lfo7_rate\",\"lfo7_phase\",\"lfo7_magnitude\","
+                    "\"lfo7_deform\",\"lfo7_trigmode\",\"lfo7_unipolar\","
+                    "\"lfo7_delay\",\"lfo7_attack\",\"lfo7_hold\","
+                    "\"lfo7_decay\",\"lfo7_sustain\",\"lfo7_release\"]"
+            "},"
+            "\"slfo3\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo8_shape\",\"lfo8_rate\",\"lfo8_magnitude\",\"lfo8_deform\","
+                    "\"lfo8_phase\",\"lfo8_delay\",\"lfo8_attack\",\"lfo8_decay\"],"
+                "\"params\":[\"lfo8_shape\",\"lfo8_rate\",\"lfo8_phase\",\"lfo8_magnitude\","
+                    "\"lfo8_deform\",\"lfo8_trigmode\",\"lfo8_unipolar\","
+                    "\"lfo8_delay\",\"lfo8_attack\",\"lfo8_hold\","
+                    "\"lfo8_decay\",\"lfo8_sustain\",\"lfo8_release\"]"
+            "},"
+            "\"slfo4\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo9_shape\",\"lfo9_rate\",\"lfo9_magnitude\",\"lfo9_deform\","
+                    "\"lfo9_phase\",\"lfo9_delay\",\"lfo9_attack\",\"lfo9_decay\"],"
+                "\"params\":[\"lfo9_shape\",\"lfo9_rate\",\"lfo9_phase\",\"lfo9_magnitude\","
+                    "\"lfo9_deform\",\"lfo9_trigmode\",\"lfo9_unipolar\","
+                    "\"lfo9_delay\",\"lfo9_attack\",\"lfo9_hold\","
+                    "\"lfo9_decay\",\"lfo9_sustain\",\"lfo9_release\"]"
+            "},"
+            "\"slfo5\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo10_shape\",\"lfo10_rate\",\"lfo10_magnitude\",\"lfo10_deform\","
+                    "\"lfo10_phase\",\"lfo10_delay\",\"lfo10_attack\",\"lfo10_decay\"],"
+                "\"params\":[\"lfo10_shape\",\"lfo10_rate\",\"lfo10_phase\",\"lfo10_magnitude\","
+                    "\"lfo10_deform\",\"lfo10_trigmode\",\"lfo10_unipolar\","
+                    "\"lfo10_delay\",\"lfo10_attack\",\"lfo10_hold\","
+                    "\"lfo10_decay\",\"lfo10_sustain\",\"lfo10_release\"]"
+            "},"
+            "\"slfo6\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo11_shape\",\"lfo11_rate\",\"lfo11_magnitude\",\"lfo11_deform\","
+                    "\"lfo11_phase\",\"lfo11_delay\",\"lfo11_attack\",\"lfo11_decay\"],"
+                "\"params\":[\"lfo11_shape\",\"lfo11_rate\",\"lfo11_phase\",\"lfo11_magnitude\","
+                    "\"lfo11_deform\",\"lfo11_trigmode\",\"lfo11_unipolar\","
+                    "\"lfo11_delay\",\"lfo11_attack\",\"lfo11_hold\","
+                    "\"lfo11_decay\",\"lfo11_sustain\",\"lfo11_release\"]"
+            "},"
             "\"scene\":{"
                 "\"children\":null,"
                 "\"knobs\":[\"volume\",\"pan\",\"pan2\",\"portamento\","
@@ -588,18 +709,8 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
         "}"
         "}");
 
-    std::string dest_opts = "[\"none\"";
-    for (int i = 0; i < inst->param_count; i++) {
-        dest_opts += ",\"";
-        dest_opts += inst->params[i].key;
-        dest_opts += "\"";
-    }
-    dest_opts += "]";
-
-    std::string source_opts = "[\"none\",\"velocity\",\"keytrack\",\"polyaftertouch\",\"aftertouch\",\"pitchbend\",\"modwheel\",\"macro1\",\"macro2\",\"macro3\",\"macro4\",\"macro5\",\"macro6\",\"macro7\",\"macro8\",\"ampeg\",\"filtereg\",\"lfo1\",\"lfo2\",\"lfo3\",\"lfo4\",\"lfo5\",\"lfo6\",\"slfo1\",\"slfo2\",\"slfo3\",\"slfo4\",\"slfo5\",\"slfo6\",\"timbre\",\"releasevelocity\",\"random_bipolar\",\"random_unipolar\",\"alternate_bipolar\",\"alternate_unipolar\",\"breath\",\"expression\",\"sustain\",\"lowest_key\",\"highest_key\",\"latest_key\"]";
-
     std::string mod_sections = "";
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < NUM_MOD_SLOTS; i++) {
         char buf[512];
         snprintf(buf, sizeof(buf), 
             ",\"mod_%d\":{"
@@ -660,24 +771,46 @@ static void build_chain_params(surge_instance_t *inst) {
                 inst->params[i].key,
                 inst->params[i].display_name,
                 inst->params[i].options_json);
-        } else {
-            offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
-                ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%f,\"max\":%f}",
-                inst->params[i].key,
-                inst->params[i].display_name,
-                type_str,
-                inst->params[i].min_val,
-                inst->params[i].max_val);
-        }
+} else {
+            if (strcmp(inst->params[i].key, "ws_drive") == 0) {
+                offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
+                    ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%f,\"max\":%f,\"unit\":\"dB\",\"step\":0.1}",
+                    inst->params[i].key,
+                    inst->params[i].display_name,
+                    type_str,
+                    inst->params[i].min_val,
+                    inst->params[i].max_val);
+            } else {
+                offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
+                    ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%f,\"max\":%f}",
+                    inst->params[i].key,
+                    inst->params[i].display_name,
+                    type_str,
+                    inst->params[i].min_val,
+                    inst->params[i].max_val);
+            }
+}
     }
 
-    for (int i = 0; i < 16 && offset < bufsize - 200; i++) {
+    std::string dest_opts = "[\"none\"";
+    for (int i = 0; i < inst->param_count; i++) {
+        // avoid some settings to keep the JSON size down
+        if (strncmp(inst->params[i].key, "mod_", 4) == 0) continue;
+        dest_opts += ",\"";
+        dest_opts += inst->params[i].key;
+        dest_opts += "\"";
+    }
+    dest_opts += "]";
+
+    std::string source_opts = "[\"none\",\"velocity\",\"keytrack\",\"polyaftertouch\",\"aftertouch\",\"pitchbend\",\"modwheel\",\"macro1\",\"macro2\",\"macro3\",\"macro4\",\"macro5\",\"macro6\",\"macro7\",\"macro8\",\"ampeg\",\"filtereg\",\"lfo1\",\"lfo2\",\"lfo3\",\"lfo4\",\"lfo5\",\"lfo6\",\"slfo1\",\"slfo2\",\"slfo3\",\"slfo4\",\"slfo5\",\"slfo6\",\"timbre\",\"releasevelocity\",\"random_bipolar\",\"random_unipolar\",\"alternate_bipolar\",\"alternate_unipolar\",\"breath\",\"expression\",\"sustain\",\"lowest_key\",\"highest_key\",\"latest_key\"]";
+
+    for (int i = 0; i < NUM_MOD_SLOTS && offset < bufsize - 200; i++) {
         offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
-            ",{\"key\":\"mod_%d_enable\",\"name\":\"Mod %d Enable\",\"type\":\"int\",\"min\":0,\"max\":1}"
-            ",{\"key\":\"mod_%d_source\",\"name\":\"Mod %d Source\",\"type\":\"int\",\"min\":0,\"max\":40}"
-            ",{\"key\":\"mod_%d_dest\",\"name\":\"Mod %d Dest\",\"type\":\"int\",\"min\":0,\"max\":%d}"
+            ",{\"key\":\"mod_%d_enable\",\"name\":\"Mod %d Enable\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]}"
+            ",{\"key\":\"mod_%d_source\",\"name\":\"Mod %d Source\",\"type\":\"enum\",\"options\":%s}"
+            ",{\"key\":\"mod_%d_dest\",\"name\":\"Mod %d Dest\",\"type\":\"enum\",\"options\":%s}"
             ",{\"key\":\"mod_%d_amount\",\"name\":\"Mod %d Amount\",\"type\":\"float\",\"min\":-1,\"max\":1}",
-            i, i, i, i, i, i, inst->param_count, i, i);
+            i, i, i, i, source_opts.c_str(), i, i, dest_opts.c_str(), i, i);
     }
 
     offset += snprintf(inst->chain_params_json + offset, bufsize - offset, "]");
@@ -914,7 +1047,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "state") == 0) {
         float fval;
 
-        for (int i = 0; i < 16; i++) {
+        /* Restore preset first (sets all engine params and default mod slots) */
+        if (json_get_number(val, "preset", &fval) == 0) {
+            int idx = (int)fval;
+            if (idx >= 0 && idx < inst->preset_count) {
+                load_preset_by_display_index(inst, idx);
+            }
+        }
+
+        for (int i = 0; i < NUM_MOD_SLOTS; i++) {
             char key_enable[32], key_source[32], key_dest[32], key_amount[32];
             snprintf(key_enable, sizeof(key_enable), "mod_%d_enable", i);
             snprintf(key_source, sizeof(key_source), "mod_%d_source", i);
@@ -940,14 +1081,6 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             }
             if (changed) {
                 apply_slot_to_synth(inst, i);
-            }
-        }
-
-        /* Restore preset first (sets all engine params to preset values) */
-        if (json_get_number(val, "preset", &fval) == 0) {
-            int idx = (int)fval;
-            if (idx >= 0 && idx < inst->preset_count) {
-                load_preset_by_display_index(inst, idx);
             }
         }
         if (json_get_number(val, "octave_transpose", &fval) == 0) {
@@ -1022,12 +1155,20 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
     if (strncmp(key, "mod_", 4) == 0) {
         int i = -1;
-        if (sscanf(key, "mod_%d_", &i) == 1 && i >= 0 && i < 16) {
-            float fval = atof(val);
-            if (strstr(key, "_enable")) inst->mod_slots[i].enabled = ((int)fval != 0);
-            else if (strstr(key, "_source")) inst->mod_slots[i].source_idx = (int)fval;
-            else if (strstr(key, "_dest")) inst->mod_slots[i].dest_idx = (int)fval;
-            else if (strstr(key, "_amount")) inst->mod_slots[i].amount = fval;
+        if (sscanf(key, "mod_%d_", &i) == 1 && i >= 0 && i < NUM_MOD_SLOTS) {
+            if (strstr(key, "_enable")) inst->mod_slots[i].enabled = (strcmp(val, "On") == 0);
+            else if (strstr(key, "_source")) {
+                std::string source_opts = "[\"none\",\"velocity\",\"keytrack\",\"polyaftertouch\",\"aftertouch\",\"pitchbend\",\"modwheel\",\"macro1\",\"macro2\",\"macro3\",\"macro4\",\"macro5\",\"macro6\",\"macro7\",\"macro8\",\"ampeg\",\"filtereg\",\"lfo1\",\"lfo2\",\"lfo3\",\"lfo4\",\"lfo5\",\"lfo6\",\"slfo1\",\"slfo2\",\"slfo3\",\"slfo4\",\"slfo5\",\"slfo6\",\"timbre\",\"releasevelocity\",\"random_bipolar\",\"random_unipolar\",\"alternate_bipolar\",\"alternate_unipolar\",\"breath\",\"expression\",\"sustain\",\"lowest_key\",\"highest_key\",\"latest_key\"]";
+                inst->mod_slots[i].source_idx = find_json_array_index(source_opts.c_str(), val);
+            }
+            else if (strstr(key, "_dest")) {
+                int idx = 0;
+                for (int p = 0; p < inst->param_count; p++) {
+                    if (strcmp(inst->params[p].key, val) == 0) { idx = p + 1; break; }
+                }
+                inst->mod_slots[i].dest_idx = idx;
+            }
+            else if (strstr(key, "_amount")) inst->mod_slots[i].amount = (float)atof(val);
             apply_slot_to_synth(inst, i);
         }
         return;
@@ -1073,6 +1214,30 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "mpe_pitch_bend_range") == 0)
         return snprintf(buf, buf_len, "%d", inst->synth ? (int)inst->synth->storage.mpePitchBendRange : 48);
 
+    if (strncmp(key, "mod_", 4) == 0) {
+        int i = -1;
+        if (sscanf(key, "mod_%d_", &i) == 1 && i >= 0 && i < NUM_MOD_SLOTS) {
+            if (strstr(key, "_enable")) {
+                return snprintf(buf, buf_len, "%s", inst->mod_slots[i].enabled ? "On" : "Off");
+            } else if (strstr(key, "_source")) {
+                std::string source_opts = "[\"none\",\"velocity\",\"keytrack\",\"polyaftertouch\",\"aftertouch\",\"pitchbend\",\"modwheel\",\"macro1\",\"macro2\",\"macro3\",\"macro4\",\"macro5\",\"macro6\",\"macro7\",\"macro8\",\"ampeg\",\"filtereg\",\"lfo1\",\"lfo2\",\"lfo3\",\"lfo4\",\"lfo5\",\"lfo6\",\"slfo1\",\"slfo2\",\"slfo3\",\"slfo4\",\"slfo5\",\"slfo6\",\"timbre\",\"releasevelocity\",\"random_bipolar\",\"random_unipolar\",\"alternate_bipolar\",\"alternate_unipolar\",\"breath\",\"expression\",\"sustain\",\"lowest_key\",\"highest_key\",\"latest_key\"]";
+                char src_str[128];
+                get_json_array_element(source_opts.c_str(), inst->mod_slots[i].source_idx, src_str, sizeof(src_str));
+                return snprintf(buf, buf_len, "%s", src_str);
+            } else if (strstr(key, "_dest")) {
+                int d_idx = inst->mod_slots[i].dest_idx;
+                if (d_idx > 0 && d_idx <= inst->param_count) {
+                    return snprintf(buf, buf_len, "%s", inst->params[d_idx - 1].key);
+                } else {
+                    return snprintf(buf, buf_len, "none");
+                }
+            } else if (strstr(key, "_amount")) {
+                return snprintf(buf, buf_len, "%.2f", inst->mod_slots[i].amount);
+            }
+        }
+        return -1;
+    }
+
     if (strcmp(key, "category_list") == 0) {
         if (!inst->categories) return snprintf(buf, buf_len, "[]");
         std::string json = "[";
@@ -1113,6 +1278,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             float v = inst->synth->getParameter01(inst->params[i].surge_id);
             offset += snprintf(buf + offset, buf_len - offset,
                 ",\"%s\":%.6f", inst->params[i].key, v);
+        }
+
+        for (int i = 0; i < NUM_MOD_SLOTS && offset < buf_len - 200; i++) {
+            offset += snprintf(buf + offset, buf_len - offset,
+                ",\"mod_%d_enable\":%d,\"mod_%d_source\":%d,\"mod_%d_dest\":%d,\"mod_%d_amount\":%.6f",
+                i, inst->mod_slots[i].enabled ? 1 : 0,
+                i, inst->mod_slots[i].source_idx,
+                i, inst->mod_slots[i].dest_idx,
+                i, inst->mod_slots[i].amount);
         }
 
         offset += snprintf(buf + offset, buf_len - offset, "}");
