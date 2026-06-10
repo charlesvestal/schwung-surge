@@ -93,11 +93,24 @@ struct surge_param_entry {
     char display_name[48];    /* Display name, e.g. "Osc 1 Pitch" */
     SurgeSynthesizer::ID surge_id;
     int valtype;              /* 0=int, 1=bool, 2=float */
+    float min_val;
+    float max_val;
+    char options_json[4096];
 };
 
 /* =====================================================================
  * Instance structure
  * ===================================================================== */
+
+typedef struct {
+    bool enabled;
+    int source_idx;
+    int dest_idx;
+    float amount;
+    long active_ptag;
+    int active_modsource;
+    bool is_active;
+} surge_mod_slot;
 
 typedef struct {
     char module_dir[256];
@@ -115,6 +128,8 @@ typedef struct {
     /* Dynamic parameter registry */
     surge_param_entry params[MAX_SURGE_PARAMS];
     int param_count;
+
+    surge_mod_slot mod_slots[16];
 
     /* Patch Categories */
     std::map<int, std::string> *category_id_to_name;
@@ -189,6 +204,30 @@ static void populate_param_registry(surge_instance_t *inst) {
 
         entry->surge_id = id;
         entry->valtype = p->valtype;
+        entry->min_val = (p->valtype == 2) ? p->val_min.f : (float)p->val_min.i;
+        entry->max_val = (p->valtype == 2) ? p->val_max.f : (float)p->val_max.i;
+        entry->options_json[0] = '\0';
+        if ((p->valtype == 0 || p->valtype == 1) && p->ctrltype != ct_filtersubtype) {
+            int min_val = p->val_min.i;
+            int max_val = p->val_max.i;
+            if (max_val > min_val && max_val - min_val < 128) {
+                std::string opts = "[";
+                for (int v = min_val; v <= max_val; v++) {
+                    if (v > min_val) opts += ",";
+                    float ef = (max_val > min_val) ? (float)(v - min_val) / (float)(max_val - min_val) : 0.0f;
+                    std::string s = p->get_display(true, ef);
+                    std::string esc;
+                    for (char c : s) {
+                        if (c == '"') esc += "\\\"";
+                        else if (c == '\\') esc += "\\\\";
+                        else esc += c;
+                    }
+                    opts += "\"" + esc + "\"";
+                }
+                opts += "]";
+                strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
+            }
+        }
 
         inst->param_count++;
     }
@@ -339,8 +378,8 @@ static void load_preset_by_display_index(surge_instance_t *inst, int display_idx
  * ===================================================================== */
 
 static void build_ui_hierarchy(surge_instance_t *inst) {
-    /* 16KB should be plenty for the hierarchy JSON */
-    const int bufsize = 16384;
+    /* 256KB should be plenty for the hierarchy JSON */
+    const int bufsize = 262144;
     inst->ui_hierarchy_json = (char*)malloc(bufsize);
     if (!inst->ui_hierarchy_json) return;
 
@@ -374,8 +413,27 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                     "{\"level\":\"lfo1\",\"label\":\"LFO 1\"},"
                     "{\"level\":\"lfo2\",\"label\":\"LFO 2\"},"
                     "{\"level\":\"lfo3\",\"label\":\"LFO 3\"},"
+                    "{\"level\":\"lfo4\",\"label\":\"LFO 4\"},"
+                    "{\"level\":\"lfo5\",\"label\":\"LFO 5\"},"
+                    "{\"level\":\"lfo6\",\"label\":\"LFO 6\"},"
                     "{\"level\":\"scene\",\"label\":\"Scene\"},"
-                    "{\"level\":\"mpe\",\"label\":\"MPE\"}"
+                    "{\"level\":\"mpe\",\"label\":\"MPE\"},"
+                    "{\"level\":\"mod_0\",\"label\":\"Mod Slot 1\"},"
+                    "{\"level\":\"mod_1\",\"label\":\"Mod Slot 2\"},"
+                    "{\"level\":\"mod_2\",\"label\":\"Mod Slot 3\"},"
+                    "{\"level\":\"mod_3\",\"label\":\"Mod Slot 4\"},"
+                    "{\"level\":\"mod_4\",\"label\":\"Mod Slot 5\"},"
+                    "{\"level\":\"mod_5\",\"label\":\"Mod Slot 6\"},"
+                    "{\"level\":\"mod_6\",\"label\":\"Mod Slot 7\"},"
+                    "{\"level\":\"mod_7\",\"label\":\"Mod Slot 8\"},"
+                    "{\"level\":\"mod_8\",\"label\":\"Mod Slot 9\"},"
+                    "{\"level\":\"mod_9\",\"label\":\"Mod Slot 10\"},"
+                    "{\"level\":\"mod_10\",\"label\":\"Mod Slot 11\"},"
+                    "{\"level\":\"mod_11\",\"label\":\"Mod Slot 12\"},"
+                    "{\"level\":\"mod_12\",\"label\":\"Mod Slot 13\"},"
+                    "{\"level\":\"mod_13\",\"label\":\"Mod Slot 14\"},"
+                    "{\"level\":\"mod_14\",\"label\":\"Mod Slot 15\"},"
+                    "{\"level\":\"mod_15\",\"label\":\"Mod Slot 16\"}"
                 "]"
             "},"
             "\"category_jump\":{"
@@ -481,6 +539,33 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
                     "\"lfo2_delay\",\"lfo2_attack\",\"lfo2_hold\","
                     "\"lfo2_decay\",\"lfo2_sustain\",\"lfo2_release\"]"
             "},"
+            "\"lfo4\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo3_shape\",\"lfo3_rate\",\"lfo3_magnitude\",\"lfo3_deform\","
+                    "\"lfo3_phase\",\"lfo3_delay\",\"lfo3_attack\",\"lfo3_decay\"],"
+                "\"params\":[\"lfo3_shape\",\"lfo3_rate\",\"lfo3_phase\",\"lfo3_magnitude\","
+                    "\"lfo3_deform\",\"lfo3_trigmode\",\"lfo3_unipolar\","
+                    "\"lfo3_delay\",\"lfo3_attack\",\"lfo3_hold\","
+                    "\"lfo3_decay\",\"lfo3_sustain\",\"lfo3_release\"]"
+            "},"
+            "\"lfo5\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo4_shape\",\"lfo4_rate\",\"lfo4_magnitude\",\"lfo4_deform\","
+                    "\"lfo4_phase\",\"lfo4_delay\",\"lfo4_attack\",\"lfo4_decay\"],"
+                "\"params\":[\"lfo4_shape\",\"lfo4_rate\",\"lfo4_phase\",\"lfo4_magnitude\","
+                    "\"lfo4_deform\",\"lfo4_trigmode\",\"lfo4_unipolar\","
+                    "\"lfo4_delay\",\"lfo4_attack\",\"lfo4_hold\","
+                    "\"lfo4_decay\",\"lfo4_sustain\",\"lfo4_release\"]"
+            "},"
+            "\"lfo6\":{"
+                "\"children\":null,"
+                "\"knobs\":[\"lfo5_shape\",\"lfo5_rate\",\"lfo5_magnitude\",\"lfo5_deform\","
+                    "\"lfo5_phase\",\"lfo5_delay\",\"lfo5_attack\",\"lfo5_decay\"],"
+                "\"params\":[\"lfo5_shape\",\"lfo5_rate\",\"lfo5_phase\",\"lfo5_magnitude\","
+                    "\"lfo5_deform\",\"lfo5_trigmode\",\"lfo5_unipolar\","
+                    "\"lfo5_delay\",\"lfo5_attack\",\"lfo5_hold\","
+                    "\"lfo5_decay\",\"lfo5_sustain\",\"lfo5_release\"]"
+            "},"
             "\"scene\":{"
                 "\"children\":null,"
                 "\"knobs\":[\"volume\",\"pan\",\"pan2\",\"portamento\","
@@ -502,12 +587,60 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
             "}"
         "}"
         "}");
+
+    std::string dest_opts = "[\"none\"";
+    for (int i = 0; i < inst->param_count; i++) {
+        dest_opts += ",\"";
+        dest_opts += inst->params[i].key;
+        dest_opts += "\"";
+    }
+    dest_opts += "]";
+
+    std::string source_opts = "[\"none\",\"velocity\",\"keytrack\",\"polyaftertouch\",\"aftertouch\",\"pitchbend\",\"modwheel\",\"macro1\",\"macro2\",\"macro3\",\"macro4\",\"macro5\",\"macro6\",\"macro7\",\"macro8\",\"ampeg\",\"filtereg\",\"lfo1\",\"lfo2\",\"lfo3\",\"lfo4\",\"lfo5\",\"lfo6\",\"slfo1\",\"slfo2\",\"slfo3\",\"slfo4\",\"slfo5\",\"slfo6\",\"timbre\",\"releasevelocity\",\"random_bipolar\",\"random_unipolar\",\"alternate_bipolar\",\"alternate_unipolar\",\"breath\",\"expression\",\"sustain\",\"lowest_key\",\"highest_key\",\"latest_key\"]";
+
+    std::string mod_sections = "";
+    for (int i = 0; i < 16; i++) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), 
+            ",\"mod_%d\":{"
+            "\"children\":null,"
+            "\"knobs\":[\"mod_%d_enable\",\"mod_%d_source\",\"mod_%d_dest\",\"mod_%d_amount\"],"
+            "\"params\":[\"mod_%d_enable\",\"mod_%d_source\",\"mod_%d_dest\",\"mod_%d_amount\"]}",
+            i, i, i, i, i, i, i, i, i);
+        mod_sections += buf;
+    }
+
+    std::string json = inst->ui_hierarchy_json;
+    if (json.length() >= 2) {
+        json.insert(json.length() - 2, mod_sections); // insert before closing } }
+    }
+    snprintf(inst->ui_hierarchy_json, bufsize, "%s", json.c_str());
+}
+
+static void apply_slot_to_synth(surge_instance_t *inst, int i) {
+    auto &slot = inst->mod_slots[i];
+
+    if (slot.is_active) {
+        inst->synth->setModDepth01(slot.active_ptag, (modsources)slot.active_modsource, 0, 0, 0.0f);
+        slot.is_active = false;
+    }
+
+    if (slot.enabled && slot.source_idx > 0 && slot.dest_idx > 0) {
+        int modsource = slot.source_idx; // 1-based matches modsources enum because 0 is original
+        long ptag = inst->params[slot.dest_idx - 1].surge_id.getSynthSideId();
+        
+        inst->synth->setModDepth01(ptag, (modsources)modsource, 0, 0, slot.amount);
+        
+        slot.active_ptag = ptag;
+        slot.active_modsource = modsource;
+        slot.is_active = true;
+    }
 }
 
 static void build_chain_params(surge_instance_t *inst) {
     /* Build chain_params JSON from the parameter registry.
      * Include preset/octave_transpose plus all registered Surge params. */
-    const int bufsize = 32768;
+    const int bufsize = 262144;
     inst->chain_params_json = (char*)malloc(bufsize);
     if (!inst->chain_params_json) return;
 
@@ -521,11 +654,30 @@ static void build_chain_params(surge_instance_t *inst) {
     for (int i = 0; i < inst->param_count && offset < bufsize - 200; i++) {
         const char *type_str = (inst->params[i].valtype == 2) ? "float" :
                                (inst->params[i].valtype == 1) ? "int" : "int";
+        if (inst->params[i].options_json[0] != '\0') {
+            offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
+                ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"enum\",\"options\":%s}",
+                inst->params[i].key,
+                inst->params[i].display_name,
+                inst->params[i].options_json);
+        } else {
+            offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
+                ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":%f,\"max\":%f}",
+                inst->params[i].key,
+                inst->params[i].display_name,
+                type_str,
+                inst->params[i].min_val,
+                inst->params[i].max_val);
+        }
+    }
+
+    for (int i = 0; i < 16 && offset < bufsize - 200; i++) {
         offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
-            ",{\"key\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"min\":0,\"max\":1}",
-            inst->params[i].key,
-            inst->params[i].display_name,
-            type_str);
+            ",{\"key\":\"mod_%d_enable\",\"name\":\"Mod %d Enable\",\"type\":\"int\",\"min\":0,\"max\":1}"
+            ",{\"key\":\"mod_%d_source\",\"name\":\"Mod %d Source\",\"type\":\"int\",\"min\":0,\"max\":40}"
+            ",{\"key\":\"mod_%d_dest\",\"name\":\"Mod %d Dest\",\"type\":\"int\",\"min\":0,\"max\":%d}"
+            ",{\"key\":\"mod_%d_amount\",\"name\":\"Mod %d Amount\",\"type\":\"float\",\"min\":-1,\"max\":1}",
+            i, i, i, i, i, i, inst->param_count, i, i);
     }
 
     offset += snprintf(inst->chain_params_json + offset, bufsize - offset, "]");
@@ -697,6 +849,63 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     }
 }
 
+static void get_json_array_element(const char *json_array, int index, char *out, int max_len) {
+    out[0] = '\0';
+    const char *p = json_array;
+    if (*p == '[') p++;
+    int current = 0;
+    while (*p && current < index) {
+        if (*p == '"') {
+            p++;
+            while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+            if (*p == '"') p++;
+        } else if (*p == ',') {
+            current++;
+            p++;
+        } else {
+            p++;
+        }
+    }
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && !(*p == '"' && *(p-1) != '\\') && i < max_len - 1) {
+            if (*p == '\\' && *(p+1) == '"') { p++; } // unescape quote
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+    }
+}
+
+static int find_json_array_index(const char *json_array, const char *val) {
+    const char *p = json_array;
+    if (*p == '[') p++;
+    int current = 0;
+    while (*p && *p != ']') {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p == '"') {
+            p++;
+            const char *start = p;
+            while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+            int len = p - start;
+            
+            bool match = true;
+            if (len != (int)strlen(val)) match = false;
+            else if (strncmp(start, val, len) != 0) match = false;
+            
+            if (match) return current;
+            
+            if (*p == '"') p++;
+            current++;
+        } else {
+            p++;
+        }
+    }
+    return 0; // fallback to 0
+}
+
 static void v2_set_param(void *instance, const char *key, const char *val) {
     surge_instance_t *inst = (surge_instance_t*)instance;
     if (!inst || !inst->synth) return;
@@ -704,6 +913,36 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     /* State restore */
     if (strcmp(key, "state") == 0) {
         float fval;
+
+        for (int i = 0; i < 16; i++) {
+            char key_enable[32], key_source[32], key_dest[32], key_amount[32];
+            snprintf(key_enable, sizeof(key_enable), "mod_%d_enable", i);
+            snprintf(key_source, sizeof(key_source), "mod_%d_source", i);
+            snprintf(key_dest, sizeof(key_dest), "mod_%d_dest", i);
+            snprintf(key_amount, sizeof(key_amount), "mod_%d_amount", i);
+
+            bool changed = false;
+            if (json_get_number(val, key_enable, &fval) == 0) {
+                inst->mod_slots[i].enabled = ((int)fval != 0);
+                changed = true;
+            }
+            if (json_get_number(val, key_source, &fval) == 0) {
+                inst->mod_slots[i].source_idx = (int)fval;
+                changed = true;
+            }
+            if (json_get_number(val, key_dest, &fval) == 0) {
+                inst->mod_slots[i].dest_idx = (int)fval;
+                changed = true;
+            }
+            if (json_get_number(val, key_amount, &fval) == 0) {
+                inst->mod_slots[i].amount = fval;
+                changed = true;
+            }
+            if (changed) {
+                apply_slot_to_synth(inst, i);
+            }
+        }
+
         /* Restore preset first (sets all engine params to preset values) */
         if (json_get_number(val, "preset", &fval) == 0) {
             int idx = (int)fval;
@@ -781,14 +1020,36 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strncmp(key, "mod_", 4) == 0) {
+        int i = -1;
+        if (sscanf(key, "mod_%d_", &i) == 1 && i >= 0 && i < 16) {
+            float fval = atof(val);
+            if (strstr(key, "_enable")) inst->mod_slots[i].enabled = ((int)fval != 0);
+            else if (strstr(key, "_source")) inst->mod_slots[i].source_idx = (int)fval;
+            else if (strstr(key, "_dest")) inst->mod_slots[i].dest_idx = (int)fval;
+            else if (strstr(key, "_amount")) inst->mod_slots[i].amount = fval;
+            apply_slot_to_synth(inst, i);
+        }
+        return;
+    }
+
 
     /* Generic Surge parameter access */
     surge_param_entry *entry = find_param(inst, key);
     if (entry) {
-        float v = (float)atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
-        inst->synth->setParameter01(entry->surge_id, v);
+        float norm_v;
+        if (entry->options_json[0] != '\0') {
+            int index = find_json_array_index(entry->options_json, val);
+            float range = entry->max_val - entry->min_val;
+            norm_v = (range > 0) ? ((float)index / range) : 0.0f;
+        } else {
+            float v = (float)atof(val);
+            float range = entry->max_val - entry->min_val;
+            norm_v = (range > 0) ? ((v - entry->min_val) / range) : 0.0f;
+        }
+        if (norm_v < 0.0f) norm_v = 0.0f;
+        if (norm_v > 1.0f) norm_v = 1.0f;
+        inst->synth->setParameter01(entry->surge_id, norm_v);
     }
 }
 
@@ -873,8 +1134,18 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     /* Generic Surge parameter access */
     surge_param_entry *entry = find_param(inst, key);
     if (entry) {
-        float v = inst->synth->getParameter01(entry->surge_id);
-        return snprintf(buf, buf_len, "%.6f", v);
+        float norm_v = inst->synth->getParameter01(entry->surge_id);
+        if (entry->options_json[0] != '\0') {
+            float range = entry->max_val - entry->min_val;
+            int index = (int)std::round(norm_v * range);
+            char opt_str[128];
+            get_json_array_element(entry->options_json, index, opt_str, sizeof(opt_str));
+            return snprintf(buf, buf_len, "%s", opt_str);
+        } else {
+            float range = entry->max_val - entry->min_val;
+            float abs_v = (norm_v * range) + entry->min_val;
+            return snprintf(buf, buf_len, "%.6f", abs_v);
+        }
     }
 
     return -1;
