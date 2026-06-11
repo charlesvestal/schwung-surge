@@ -23,6 +23,7 @@
 /* Plugin API definitions */
 extern "C" {
 #include <stdint.h>
+#include <time.h>
 
 #define MOVE_PLUGIN_API_VERSION 1
 #define MOVE_SAMPLE_RATE 44100
@@ -145,6 +146,13 @@ typedef struct {
     /* Pre-built JSON strings */
     char *ui_hierarchy_json;
     char *chain_params_json;
+
+    /* Auto BPM Sync */
+    bool sync_bpm;
+    double bpm;
+    double last_clock_time;
+    int clock_count;
+    double clock_time_sum;
 } surge_instance_t;
 
 /* =====================================================================
@@ -689,9 +697,9 @@ static void build_ui_hierarchy(surge_instance_t *inst) {
             "},"
             "\"scene\":{"
                 "\"children\":null,"
-                "\"knobs\":[\"volume\",\"pan\",\"pan2\",\"portamento\","
+                "\"knobs\":[\"sync_bpm\",\"bpm\",\"octave_transpose\",\"volume\",\"pan\",\"pan2\",\"portamento\","
                     "\"drift\",\"feedback\",\"ws_type\",\"ws_drive\"],"
-                "\"params\":[\"octave\",\"pitch\",\"portamento\",\"polymode\","
+                "\"params\":[\"sync_bpm\",\"bpm\",\"octave_transpose\",\"octave\",\"pitch\",\"portamento\",\"polymode\","
                     "\"volume\",\"pan\",\"pan2\","
                     "\"fm_switch\",\"fm_depth\",\"drift\",\"noisecol\","
                     "\"feedback\",\"fb_config\",\"f_balance\",\"lowcut\","
@@ -759,6 +767,8 @@ static void build_chain_params(surge_instance_t *inst) {
     offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
         "[{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":9999}"
         ",{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-3,\"max\":3}"
+        ",{\"key\":\"sync_bpm\",\"name\":\"Auto BPM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]}"
+        ",{\"key\":\"bpm\",\"name\":\"BPM\",\"type\":\"int\",\"min\":20,\"max\":300}"
         ",{\"key\":\"mpe_enabled\",\"name\":\"MPE Enabled\",\"type\":\"int\",\"min\":0,\"max\":1}"
         ",{\"key\":\"mpe_pitch_bend_range\",\"name\":\"MPE PB Range\",\"type\":\"int\",\"min\":1,\"max\":96}");
 
@@ -830,6 +840,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
 
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     inst->output_gain = 0.5f;
+    inst->sync_bpm = true;
+    inst->bpm = 120.0;
+    inst->last_clock_time = 0.0;
+    inst->clock_count = 0;
+    inst->clock_time_sum = 0.0;
     snprintf(inst->preset_name, sizeof(inst->preset_name), "Init");
     inst->error_msg[0] = '\0';
 
@@ -936,8 +951,42 @@ static void v2_destroy_instance(void *instance) {
 
 static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) {
     surge_instance_t *inst = (surge_instance_t*)instance;
-    if (!inst || !inst->synth || len < 2) return;
+    if (!inst || !inst->synth || len < 1) return;
     (void)source;
+
+    /* Auto BPM Sync calculation */
+    if (msg[0] == 0xF8) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double now = ts.tv_sec + ts.tv_nsec / 1e9;
+        
+        if (inst->last_clock_time > 0.0) {
+            double delta = now - inst->last_clock_time;
+            if (delta > 0.005 && delta < 0.2) {
+                inst->clock_time_sum += delta;
+                inst->clock_count++;
+                if (inst->clock_count >= 24) {
+                    double avg_delta = inst->clock_time_sum / inst->clock_count;
+                    double bpm = 60.0 / (avg_delta * 24.0);
+                    if (bpm >= 20.0 && bpm <= 300.0) {
+                        if (inst->sync_bpm) {
+                            inst->bpm = bpm;
+                            inst->synth->time_data.tempo = bpm;
+                        }
+                    }
+                    inst->clock_time_sum = 0.0;
+                    inst->clock_count = 0;
+                }
+            } else {
+                inst->clock_time_sum = 0.0;
+                inst->clock_count = 0;
+            }
+        }
+        inst->last_clock_time = now;
+        return;
+    }
+
+    if (len < 2) return;
 
     uint8_t status = msg[0] & 0xF0;
     uint8_t channel = msg[0] & 0x0F;
@@ -1049,9 +1098,21 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         /* Restore preset first (sets all engine params and default mod slots) */
         if (json_get_number(val, "preset", &fval) == 0) {
-            int idx = (int)fval;
-            if (idx >= 0 && idx < inst->preset_count) {
-                load_preset_by_display_index(inst, idx);
+            int preset = (int)fval;
+            load_preset_by_display_index(inst, preset);
+        }
+        if (json_get_number(val, "octave_transpose", &fval) == 0) {
+            inst->octave_transpose = (int)fval;
+            if (inst->octave_transpose < -3) inst->octave_transpose = -3;
+            if (inst->octave_transpose > 3) inst->octave_transpose = 3;
+        }
+        if (json_get_number(val, "sync_bpm", &fval) == 0) {
+            inst->sync_bpm = (fval != 0.0f);
+        }
+        if (json_get_number(val, "bpm", &fval) == 0) {
+            inst->bpm = fval;
+            if (!inst->sync_bpm && inst->synth) {
+                inst->synth->time_data.tempo = inst->bpm;
             }
         }
 
@@ -1083,11 +1144,6 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 apply_slot_to_synth(inst, i);
             }
         }
-        if (json_get_number(val, "octave_transpose", &fval) == 0) {
-            inst->octave_transpose = (int)fval;
-            if (inst->octave_transpose < -3) inst->octave_transpose = -3;
-            if (inst->octave_transpose > 3) inst->octave_transpose = 3;
-        }
         if (json_get_number(val, "mpe_enabled", &fval) == 0) {
             inst->synth->mpeEnabled = ((int)fval > 0);
         }
@@ -1116,6 +1172,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         }
         return;
     }
+    if (strcmp(key, "sync_bpm") == 0) {
+        inst->sync_bpm = (atoi(val) != 0);
+        return;
+    }
+
+    if (strcmp(key, "bpm") == 0) {
+        inst->bpm = atof(val);
+        if (!inst->sync_bpm && inst->synth) {
+            inst->synth->time_data.tempo = inst->bpm;
+        }
+        return;
+    }
+
     if (strcmp(key, "octave_transpose") == 0) {
         inst->octave_transpose = atoi(val);
         if (inst->octave_transpose < -3) inst->octave_transpose = -3;
@@ -1201,6 +1270,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     /* Module-level params */
     if (strcmp(key, "preset") == 0)
         return snprintf(buf, buf_len, "%d", inst->current_preset);
+    if (strcmp(key, "sync_bpm") == 0)
+        return snprintf(buf, buf_len, "%d", inst->sync_bpm ? 1 : 0);
+    if (strcmp(key, "bpm") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->bpm);
     if (strcmp(key, "preset_count") == 0)
         return snprintf(buf, buf_len, "%d", inst->preset_count);
     if (strcmp(key, "preset_name") == 0)
@@ -1269,8 +1342,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "state") == 0) {
         int offset = 0;
         offset += snprintf(buf + offset, buf_len - offset,
-            "{\"preset\":%d,\"octave_transpose\":%d,\"mpe_enabled\":%d,\"mpe_pitch_bend_range\":%d",
-            inst->current_preset, inst->octave_transpose,
+            "{\"preset\":%d,\"octave_transpose\":%d,\"sync_bpm\":%d,\"bpm\":%.1f,\"mpe_enabled\":%d,\"mpe_pitch_bend_range\":%d",
+            inst->current_preset, inst->octave_transpose, inst->sync_bpm ? 1 : 0, inst->bpm,
             inst->synth ? (int)inst->synth->mpeEnabled : 0,
             inst->synth ? (int)inst->synth->storage.mpePitchBendRange : 48);
 
