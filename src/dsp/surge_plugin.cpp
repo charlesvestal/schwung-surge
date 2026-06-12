@@ -178,6 +178,25 @@ static int json_get_number(const char *json, const char *key, float *out) {
     return 0;
 }
 
+static int json_get_string(const char *json, const char *key, char *out, int out_len) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *pos = strstr(json, search);
+    if (!pos) return -1;
+    pos += strlen(search);
+    while (*pos == ' ') pos++;
+    if (*pos == '"') {
+        pos++;
+        int i = 0;
+        while (*pos && *pos != '"' && i < out_len - 1) {
+            out[i++] = *pos++;
+        }
+        out[i] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
 /* =====================================================================
  * Parameter registry population
  * ===================================================================== */
@@ -1097,7 +1116,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         float fval;
 
         /* Restore preset first (sets all engine params and default mod slots) */
-        if (json_get_number(val, "preset", &fval) == 0) {
+        char pname[128];
+        bool preset_loaded = false;
+        if (json_get_string(val, "preset_name", pname, sizeof(pname)) == 0) {
+            for (int i = 0; i < (int)inst->synth->storage.patchOrdering.size(); i++) {
+                int raw_idx = inst->synth->storage.patchOrdering[i];
+                if (inst->synth->storage.patch_list[raw_idx].name == pname) {
+                    load_preset_by_display_index(inst, i);
+                    preset_loaded = true;
+                    break;
+                }
+            }
+        }
+        if (!preset_loaded && json_get_number(val, "preset", &fval) == 0) {
             int preset = (int)fval;
             load_preset_by_display_index(inst, preset);
         }
@@ -1342,8 +1373,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "state") == 0) {
         int offset = 0;
         offset += snprintf(buf + offset, buf_len - offset,
-            "{\"preset\":%d,\"octave_transpose\":%d,\"sync_bpm\":%d,\"bpm\":%.1f,\"mpe_enabled\":%d,\"mpe_pitch_bend_range\":%d",
-            inst->current_preset, inst->octave_transpose, inst->sync_bpm ? 1 : 0, inst->bpm,
+            "{\"preset\":%d,\"preset_name\":\"%s\",\"octave_transpose\":%d,\"sync_bpm\":%d,\"bpm\":%.1f,\"mpe_enabled\":%d,\"mpe_pitch_bend_range\":%d",
+            inst->current_preset, inst->preset_name, inst->octave_transpose, inst->sync_bpm ? 1 : 0, inst->bpm,
             inst->synth ? (int)inst->synth->mpeEnabled : 0,
             inst->synth ? (int)inst->synth->storage.mpePitchBendRange : 48);
 

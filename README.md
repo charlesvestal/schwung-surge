@@ -10,6 +10,9 @@ Wavetable, FM, subtractive, and physical modeling synthesis with 600+ factory pr
 - Dual filters with multiple filter types
 - 3 LFOs per scene with sine, triangle, square, ramp, noise, S&H, envelope, and step sequencer shapes
 - Amplitude and filter envelopes
+- 6 modulation slots for routing LFOs and Envelopes to various synth parameters
+- Auto BPM Sync automatically locks the synth to the host tempo via MIDI clock (manual override available)
+- Full state saving ensures your exact preset choice and parameter tweaks are perfectly restored
 - 600+ factory presets across 15 categories
 - Works standalone or as a sound generator in Signal Chain patches
 
@@ -57,6 +60,15 @@ Oscillators 1-3, Mixer, Filters 1-2, Amp Envelope, Filter Envelope, LFOs 1-3, an
 ## Preset Categories
 
 Basses, Brass, Chords, FX, Keys, Leads, MPE, Pads, Percussion, Plucks, Polysynths, Sequences, Splits, Vocoder, Winds
+
+## Adding User Presets
+
+You can add your own `.fxp` patches to the device. Surge XT will automatically scan them and expose them in the preset selection list.
+
+Place your presets in the following directory on the Move device:
+`/data/UserData/schwung/surge-config/Documents/Surge XT/Patches/`
+
+*(Note: You can organize your presets into subdirectories within the Patches folder, and Surge XT will categorize them accordingly).*
 
 ## License
 
