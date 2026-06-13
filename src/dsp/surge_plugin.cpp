@@ -940,7 +940,15 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     /* Count available patches (using sorted ordering) */
     inst->preset_count = (int)inst->synth->storage.patchOrdering.size();
     if (inst->preset_count > 0) {
-        load_preset_by_display_index(inst, 0);
+        int default_idx = 0;
+        for (int i = 0; i < inst->preset_count; i++) {
+            int raw_idx = inst->synth->storage.patchOrdering[i];
+            if (inst->synth->storage.patch_list[raw_idx].name == "Organ 2 Aftertouch") {
+                default_idx = i;
+                break;
+            }
+        }
+        load_preset_by_display_index(inst, default_idx);
     }
 
     /* Build JSON strings */
