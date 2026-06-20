@@ -86,3 +86,11 @@ set_target_properties(surge-move-plugin PROPERTIES
     SUFFIX ".so"
 )
 
+# Copy custom default preset from data/ if present
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/Organ 2 Aftertouch.fxp")
+    message(STATUS "Installing custom Organ 2 Aftertouch preset from data/")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/Organ 2 Aftertouch.fxp"
+         DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/surge/resources/data/patches_factory/Keys")
+endif()
+
+
