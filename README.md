@@ -1,4 +1,4 @@
-# Surge XT for Move Everything
+# Surge XT for Schwung
 
 Hybrid synthesizer module based on [Surge XT](https://github.com/surge-synthesizer/surge) by the Surge Synth Team.
 
@@ -10,6 +10,9 @@ Wavetable, FM, subtractive, and physical modeling synthesis with 600+ factory pr
 - Dual filters with multiple filter types
 - 3 LFOs per scene with sine, triangle, square, ramp, noise, S&H, envelope, and step sequencer shapes
 - Amplitude and filter envelopes
+- 6 modulation slots for routing LFOs and Envelopes to various synth parameters
+- Auto BPM Sync automatically locks the synth to the host tempo via MIDI clock (manual override available)
+- Full state saving ensures your exact preset choice and parameter tweaks are perfectly restored
 - 600+ factory presets across 15 categories
 - Works standalone or as a sound generator in Signal Chain patches
 
@@ -17,18 +20,18 @@ Wavetable, FM, subtractive, and physical modeling synthesis with 600+ factory pr
 
 - **Lua/Formula Modulator not supported** - Surge's Formula Modulator LFO shape requires LuaJIT, which is not included in this build. Patches that use Formula Modulator LFOs will still load and produce sound, but the formula-driven modulation will not be active. The Tutorials preset folder (which relies heavily on Formula Modulator) is excluded.
 - **Scene B not exposed** - Only Scene A parameters are accessible. Scene B exists internally but is not routed to the UI.
-- **No FX section** - Surge's built-in effects are not exposed (use Signal Chain audio FX instead).
+- **No FX section** - Surge's built-in effects of presets applied but are not exposed (use Signal Chain audio FX for further effects).
 
 ## Prerequisites
 
-- [Move Everything](https://github.com/charlesvestal/move-everything) installed on your Ableton Move
+- [Schwung](https://github.com/charlesvestal/schwung) installed on your Ableton Move
 - SSH access enabled: http://move.local/development/ssh
 
 ## Install
 
 ### Via Module Store (Recommended)
 
-1. Launch Move Everything on your Move
+1. Launch Schwung on your Move
 2. Select **Module Store** from the main menu
 3. Navigate to **Sound Generators** > **Surge XT**
 4. Select **Install**
@@ -38,8 +41,8 @@ Wavetable, FM, subtractive, and physical modeling synthesis with 600+ factory pr
 Requires Docker (recommended) or ARM64 cross-compiler.
 
 ```bash
-git clone --recursive https://github.com/charlesvestal/move-everything-surge
-cd move-anything-surge
+git clone --recursive https://github.com/charlesvestal/schwung-surge
+cd schwung-surge
 ./scripts/build.sh
 ./scripts/install.sh
 ```
@@ -58,6 +61,16 @@ Oscillators 1-3, Mixer, Filters 1-2, Amp Envelope, Filter Envelope, LFOs 1-3, an
 
 Basses, Brass, Chords, FX, Keys, Leads, MPE, Pads, Percussion, Plucks, Polysynths, Sequences, Splits, Vocoder, Winds
 
+## Adding User Presets
+
+You can add your own `.fxp` patches to the device. Surge XT will automatically scan them and expose them in the preset selection list.
+
+Place your presets in the following directory on the Move device:
+`/data/UserData/schwung/surge-config/Documents/Surge XT/Patches/`
+
+*Note: You can organize your presets into subdirectories within the Patches folder, e.g. "Keys" or "Private/Keys", and Surge XT will categorize them accordingly. A large amount
+of 3rd party patches is available even [within the mainline repository](https://github.com/surge-synthesizer/surge/tree/main/resources/data/patches_3rdparty).*
+
 ## License
 
 GPL-3.0 - See [LICENSE](LICENSE)
@@ -66,7 +79,7 @@ Based on Surge XT by the Surge Synth Team, which is also GPL-3.0 licensed.
 
 ## AI Assistance Disclaimer
 
-This module is part of Move Everything and was developed with AI assistance, including Claude, Codex, and other AI assistants.
+This module is part of Schwung and was developed with AI assistance, including Claude, Codex, and other AI assistants.
 
 All architecture, implementation, and release decisions are reviewed by human maintainers.  
 AI-assisted content may still contain errors, so please validate functionality, security, and license compatibility before production use.

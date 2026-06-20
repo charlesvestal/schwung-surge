@@ -173,6 +173,24 @@
       ]
     },
     {
+      "title": "State & BPM",
+      "lines": [
+        "Full state saving:",
+        " Custom tweaks and",
+        " your preset choice",
+        " are saved with",
+        " your Move Sets.",
+        "",
+        "Auto BPM Sync:",
+        " Automatically syncs",
+        " to Move's tempo",
+        " via MIDI clock.",
+        " Manual BPM override",
+        " is also available",
+        " in Scene settings."
+      ]
+    },
+    {
       "title": "MPE Setup",
       "lines": [
         "For MPE controllers",
