@@ -786,10 +786,10 @@ static void build_chain_params(surge_instance_t *inst) {
     offset += snprintf(inst->chain_params_json + offset, bufsize - offset,
         "[{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":9999}"
         ",{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-3,\"max\":3}"
-        ",{\"key\":\"sync_bpm\",\"name\":\"Auto BPM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]}"
+        ",{\"key\":\"sync_bpm\",\"short_name\":\"Auto\",\"name\":\"Auto BPM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]}"
         ",{\"key\":\"bpm\",\"name\":\"BPM\",\"type\":\"int\",\"min\":20,\"max\":300}"
-        ",{\"key\":\"mpe_enabled\",\"name\":\"MPE Enabled\",\"type\":\"int\",\"min\":0,\"max\":1}"
-        ",{\"key\":\"mpe_pitch_bend_range\",\"name\":\"MPE PB Range\",\"type\":\"int\",\"min\":1,\"max\":96}");
+        ",{\"key\":\"mpe_enabled\",\"short_name\":\"Enabled\",\"name\":\"MPE Enabled\",\"type\":\"int\",\"min\":0,\"max\":1}"
+        ",{\"key\":\"mpe_pitch_bend_range\",\"short_name\":\"PB Range\",\"name\":\"MPE PB Range\",\"type\":\"int\",\"min\":1,\"max\":96}");
 
     for (int i = 0; i < inst->param_count && offset < bufsize - 200; i++) {
         const char *type_str = (inst->params[i].valtype == 2) ? "float" :
