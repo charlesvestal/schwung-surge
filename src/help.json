@@ -13,8 +13,8 @@
         "synthesis modes.",
         "",
         "3 oscillators, 2",
-        "filters, 3 LFOs,",
-        "and full ADSR",
+        "filters, 12 LFOs,",
+        "and DAHDSR",
         "envelopes.",
         "",
         "Factory preset",
@@ -103,9 +103,12 @@
           "title": "Envelopes",
           "lines": [
             "Amp Envelope:",
-            " Attack, Hold, Decay",
+            " Attack, Decay,",
             " Sustain, Release",
-            " Shape, Mode",
+            " Attack Shape,",
+            " Decay Shape,",
+            " Release Shape,",
+            " Mode",
             "",
             "Filter Envelope:",
             " Same parameters,",
@@ -120,17 +123,22 @@
         {
           "title": "LFOs",
           "lines": [
-            "3 LFOs available.",
+            "12 LFOs: 6 voice",
+            "LFOs (LFO 1-6) and",
+            "6 scene LFOs",
+            "(Scene LFO 1-6).",
             "",
-            "Each LFO has:",
-            " Rate (free or sync)",
-            " Shape, Phase",
-            " Amplitude, Deform",
-            " Delay, Fade-in",
+            "Each LFO has 13",
+            "parameters:",
+            " Shape, Rate, Phase",
+            " Magnitude, Deform",
+            " Trigger Mode",
+            " Unipolar",
             "",
-            "12 parameters per",
-            "LFO for deep",
-            "modulation control."
+            "Plus its own DAHDSR",
+            "envelope: Delay,",
+            "Attack, Hold, Decay,",
+            "Sustain, Release."
           ]
         },
         {
@@ -144,8 +152,26 @@
             "octave offset, and",
             "filter routing.",
             "",
-            "19 scene parameters",
+            "28 scene parameters",
             "available."
+          ]
+        },
+        {
+          "title": "Modulation",
+          "lines": [
+            "6 modulation slots",
+            "(Mod Slot 1-6).",
+            "",
+            "Each slot has:",
+            " Enable",
+            " Source",
+            " Destination",
+            " Amount",
+            "",
+            "Jump to Category on",
+            "the main menu jumps",
+            "the preset list to a",
+            "chosen category."
           ]
         }
       ]
