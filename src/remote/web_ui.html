@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Surge XT</title>
+<!--
+  Custom Remote UI for the Surge XT module. Schwung Manager finds this file
+  beside module.json and loads it in a sandboxed iframe on its Remote UI page;
+  assets/ resolves under /api/remote-ui/module-assets/surge/. The plugin writes
+  the page's metadata and pictures to remote/ in the same folder. Everything the
+  page needs ships with the module; the only outside script is the manager's
+  own bridge. See docs/REMOTE_UI.md.
+-->
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<main id="app" aria-label="Surge XT"></main>
+<script src="/static/schwung-remote-api.js"></script>
+<script src="assets/surge-meta.js"></script>
+<script src="assets/surge-format.js"></script>
+<script src="assets/core.js"></script>
+<script src="assets/widgets.js"></script>
+<script src="assets/views.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
