@@ -172,7 +172,7 @@
         var g1 = h("div", "grid two");
         /* macros: Surge's eight assignable controllers, labelled by the patch */
         var sm = section("Macros", "patch controls", "scene-g");
-        var row = h("div", "play-macros");
+        var row = h("div", "macros");
         for (var i = 0; i < 8; i++) { var m = S.params.macros && S.params.macros[i]; var w = reg(W.macro(i, m && m.label)); row.appendChild(w.el); }
         sm.appendChild(row);
         /* filters as a pad */
@@ -182,7 +182,6 @@
         var lbl = {}; lbl[k("filter1_envmod")] = "F1 env depth"; lbl[k("filter2_envmod")] = "F2 env depth";
         knobs(quick, [k("filter1_envmod"), k("filter2_envmod"), k("feedback"), k("volume")], { labels: lbl });
         sf.appendChild(quick);
-        row.classList.add("tall");
         g1.appendChild(sm); g1.appendChild(sf);
         v.appendChild(g1);
         var g2 = h("div", "grid two");
@@ -280,13 +279,14 @@
             s.appendChild(reg(oscTypeStrip(typeKey)).el);
             var sc = reg(W.scope(function (g2, w, h2) { var wv = S.waves && S.waves.scenes[V.scene] && S.waves.scenes[V.scene][o - 1]; drawWave(g2, w, h2, wv && wv.w, acc()); if (wv && wv.wt) { g2.fillStyle = "rgba(128,128,128,0.7)"; g2.font = "600 10px " + getComputedStyle(document.body).getPropertyValue("--mono"); g2.fillText(wv.wt, 8, 14); } }));
             sc.any = true; s.appendChild(sc.el);
-            var c1 = cells("compact"); knobs(c1, [k("osc" + o + "_octave"), k("osc" + o + "_pitch"), k("osc" + o + "_keytrack"), k("osc" + o + "_retrigger")]); s.appendChild(c1);
-            var c2 = cells("compact"); for (var i = 0; i < 7; i++) knobs(c2, [k("osc" + o + "_param" + i)]); s.appendChild(c2);
+            var c1 = cells("compact"); knobs(c1, [k("osc" + o + "_octave"), k("osc" + o + "_pitch"), k("osc" + o + "_keytrack"), k("osc" + o + "_retrigger")]);
+            for (var i = 0; i < 7; i++) knobs(c1, [k("osc" + o + "_param" + i)]);
+            s.appendChild(c1);
             g.appendChild(s);
         })(o);
         v.appendChild(g);
         var mix = section("Mixer", "level \u00B7 mute \u00B7 solo \u00B7 route"); var mx = h("div", "mixer");
-        [["o1", "Osc 1"], ["o2", "Osc 2"], ["o3", "Osc 3"], ["noise", "Noise"], ["ring12", "Ring 1\u00D72"], ["ring23", "Ring 2\u00D73"], ["pfg", "Pre-filter gain"]].forEach(function (ch) {
+        [["o1", "Osc 1"], ["o2", "Osc 2"], ["o3", "Osc 3"], ["noise", "Noise"], ["ring12", "Ring 1\u00D72"], ["ring23", "Ring 2\u00D73"], ["pfg", "Pre-filter"]].forEach(function (ch) {
             var col = h("div", "chan");
             var lv = reg(W.slider(k("level_" + ch[0]), { label: ch[1] })); col.appendChild(lv.el);
             if (has(k("mute_" + ch[0]))) { var mini = h("div", "mini"); [["mute", "M"], ["solo", "S"]].forEach(function (m) { var key = k(m[0] + "_" + ch[0]); if (!has(key)) return; var b = h("button", "", m[1]); b.type = "button"; b.setAttribute("aria-pressed", "false"); b.title = m[0]; b.addEventListener("click", function () { C.setNorm(key, C.val(key) > 0.5 ? 0 : 1); paint(); }); function paint() { b.setAttribute("aria-pressed", String(C.val(key) > 0.5)); } reg({ key: key, paint: paint }); mini.appendChild(b); });
@@ -363,6 +363,7 @@
     VIEWS.mod = function (v) {
         var g = h("div", "grid two");
         var sm = section("Modulation slots", "six routings you set", "scene-g");
+        v.appendChild(sm);
         var chain = C.chain || [];
         var srcOpts = (chain.filter(function (c) { return c.key === "mod_0_source"; })[0] || {}).options || META.modsource_names || [];
         var destKeys = S.params.params.map(function (p) { return p.k; });
@@ -402,32 +403,42 @@
             rl.appendChild(r);
         });
         sr.appendChild(rl);
-        g.appendChild(sm); g.appendChild(sr); v.appendChild(g);
-        var smac = section("Macros", "labels from the patch", "scene-g"); var row = h("div", "play-macros");
+        var smac = section("Macros", "labels from the patch", "scene-g"); var row = h("div", "macros");
         for (var j = 0; j < 8; j++) { var m2 = S.params.macros && S.params.macros[j]; row.appendChild(reg(W.macro(j, m2 && m2.label)).el); }
-        smac.appendChild(row); v.appendChild(smac);
+        smac.appendChild(row);
+        g.appendChild(sr); g.appendChild(smac); v.appendChild(g);
     };
 
     VIEWS.fx = function (v) {
         var order = [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15];   // fxslot_order: A1-4, B1-4, S1-4, G1-4
         var groups = [["A Insert", order.slice(0, 4), ""], ["B Insert", order.slice(4, 8), "scene-b"], ["Send", order.slice(8, 12), "scene-g"], ["Global", order.slice(12, 16), "scene-g"]];
+        /* Four uniform cards per group -- the slot's name and its type -- and under
+         * the row one wide strip per ACTIVE slot with its twelve controls in a
+         * line. Cards stay a grid of the chain; the controls get the width
+         * twelve knobs need. */
         groups.forEach(function (grp) {
-            var g = h("div", "grid four " + grp[2]);
+            var wrap = h("div", "fxgroup " + grp[2]);
+            var g = h("div", "grid four");
+            var details = [];
             grp[1].forEach(function (slot) {
-                var typeKey = "fx" + slot + "_type", tp = S.byKey[typeKey];
-                var s = section((META.fxslot_shortnames && META.fxslot_shortnames[slot]) || ("FX " + slot), (META.fxslot_names && META.fxslot_names[slot]) || "");
-                s.classList.add("fxslot");
+                var typeKey = "fx" + slot + "_type";
+                var shortName = (META.fxslot_shortnames && META.fxslot_shortnames[slot]) || ("FX " + slot), longName = (META.fxslot_names && META.fxslot_names[slot]) || "";
+                var s = section(shortName, longName); s.classList.add("fxslot");
                 var head = h("div", "head");
                 var tw = reg(W.choice(typeKey, { label: "Type", maxSeg: 0 })); tw.el.querySelector(".label").remove(); head.appendChild(tw.el);
                 s.appendChild(head);
+                var d = section(shortName, ""); d.classList.add("fxdetail"); var dtag = d.querySelector(".tag") || h("span", "tag"); if (!dtag.parentNode) d.querySelector("h2").appendChild(dtag);
                 var c = cells();
                 for (var i = 0; i < 12; i++) knobs(c, ["fx" + slot + "_p" + i]);
-                if (slot >= 8 && slot <= 11) { var rl = {}; rl["g_volume_FX" + (slot - 7)] = "Return"; knobs(c, ["g_volume_FX" + (slot - 7)], { labels: rl }); }
-                s.appendChild(c);
-                reg({ key: typeKey, paint: function () { s.classList.toggle("off", (C.natural(typeKey) || 0) === 0); } });
-                g.appendChild(s);
+                /* the send slots (fxslot_send1..4 = 4, 5, 12, 13) have a return level, a global parameter */
+                var sendNo = { 4: 1, 5: 2, 12: 3, 13: 4 }[slot];
+                if (sendNo) { var rl = {}; rl["g_volume_FX" + sendNo] = "Return"; knobs(c, ["g_volume_FX" + sendNo], { labels: rl }); }
+                d.appendChild(c);
+                reg({ key: typeKey, paint: function () { var off = (C.natural(typeKey) || 0) === 0; s.classList.toggle("on", !off); d.hidden = off || !c.children.length; dtag.textContent = off ? "" : longName + " \u00B7 " + C.text(typeKey); } });
+                g.appendChild(s); details.push(d);
             });
-            var hd = h("h2", "", ""); v.appendChild(g);
+            wrap.appendChild(g); details.forEach(function (d) { wrap.appendChild(d); });
+            v.appendChild(wrap);
         });
     };
 
@@ -441,7 +452,7 @@
         c3.appendChild(moduleToggle("sync_bpm", "Auto BPM").el); c3.appendChild(moduleNumber("bpm", "BPM", 20, 300).el);
         s3.appendChild(c3);
         g.appendChild(s1); g.appendChild(s2); g.appendChild(s3); v.appendChild(g);
-        var s4 = section("Files", "what the module wrote for this page", "scene-g quiet"); var c4 = cells();
+        var s4 = section("Files", "what the module wrote for this page", "scene-g quiet"); var c4 = h("div", "row");
         var rb = h("button", "btn", "Re-read everything"); rb.type = "button"; rb.addEventListener("click", C.refreshAll); c4.appendChild(rb);
         var info = h("div", "hint"); info.textContent = "patch rev " + (S.params ? S.params.rev : "-") + " \u00B7 " + (S.params ? S.params.params.length : 0) + " parameters \u00B7 presets " + (S.presets ? S.presets.count : "-"); c4.appendChild(info);
         s4.appendChild(c4); v.appendChild(s4);
@@ -449,25 +460,25 @@
 
     /* ---- module-level (non-Surge) controls -------------------------------------------------- */
     function moduleChoice(key, label, options, base) {
-        var c = h("div", "cell choice-cell"); c.appendChild(h("div", "label", label));
+        var sh = W.shell("choice-cell seg-cell", label), c = sh.el;
         var seg = h("div", "choice seg"); seg.setAttribute("role", "radiogroup");
         var btns = options.map(function (o, i) { var b = h("button", "", o); b.type = "button"; b.setAttribute("role", "radio"); b.addEventListener("click", function () { C.setModule(key, base + i); paint(); }); seg.appendChild(b); return b; });
-        c.appendChild(seg);
+        sh.ctl.appendChild(seg);
         function paint() { var v = parseInt(S.vals[key], 10); btns.forEach(function (b, i) { b.setAttribute("aria-checked", String(base + i === v)); }); }
         return reg({ el: c, key: key, paint: paint });
     }
     function moduleToggle(key, label) {
-        var c = h("div", "cell toggle-cell"); var b = h("button", "toggle"); b.type = "button"; b.setAttribute("role", "switch"); b.innerHTML = '<span class="knb"></span>'; b.setAttribute("aria-label", label);
+        var sh = W.shell("toggle-cell", label), c = sh.el; var b = h("button", "toggle"); b.type = "button"; b.setAttribute("role", "switch"); b.innerHTML = '<span class="knb"></span>'; b.setAttribute("aria-label", label);
         b.addEventListener("click", function () { var on = parseInt(S.vals[key], 10) === 1; C.setModule(key, on ? 0 : 1); paint(); });
-        c.appendChild(b); c.appendChild(h("div", "label", label));
-        function paint() { b.setAttribute("aria-checked", String(parseInt(S.vals[key], 10) === 1)); }
+        sh.ctl.appendChild(b);
+        function paint() { var on = parseInt(S.vals[key], 10) === 1; b.setAttribute("aria-checked", String(on)); sh.val.textContent = S.vals[key] === undefined ? "--" : (on ? "On" : "Off"); }
         return reg({ el: c, key: key, paint: paint });
     }
     function moduleNumber(key, label, min, max) {
-        var c = h("div", "cell knob-cell"); c.appendChild(h("div", "label", label));
+        var sh = W.shell("knob-cell", label), c = sh.el;
         var kn = h("div", "knob"); kn.tabIndex = 0; kn.setAttribute("role", "slider"); kn.setAttribute("aria-label", label);
         kn.innerHTML = '<svg viewBox="0 0 64 64"><circle class="well" cx="32" cy="32" r="30"/><path class="track" d="M12.9 51.1 A26 26 0 1 1 51.1 51.1"/><path class="arc" d=""/><circle class="cap" cx="32" cy="32" r="19"/><line class="ptr" x1="32" y1="30" x2="32" y2="16"/></svg>';
-        var val = h("div", "value"); c.appendChild(kn); c.appendChild(val);
+        var val = sh.val; sh.ctl.appendChild(kn);
         function cur() { var v = parseFloat(S.vals[key]); return isNaN(v) ? min : v; }
         function paint() { var n = (cur() - min) / (max - min); kn.querySelector(".ptr").style.transform = "rotate(" + (-135 + 270 * n) + "deg)"; var a = -135 + 270 * n, p0 = [32 + 26 * Math.cos((-135 - 90) * Math.PI / 180), 32 + 26 * Math.sin((-135 - 90) * Math.PI / 180)], p1 = [32 + 26 * Math.cos((a - 90) * Math.PI / 180), 32 + 26 * Math.sin((a - 90) * Math.PI / 180)]; kn.querySelector(".arc").setAttribute("d", "M" + p0[0] + " " + p0[1] + " A26 26 0 " + (a + 135 > 180 ? 1 : 0) + " 1 " + p1[0] + " " + p1[1]); val.textContent = Math.round(cur()); }
         W.bindDrag(kn, { get: function () { return (cur() - min) / (max - min); }, set: function (n) { C.setModule(key, Math.round(min + n * (max - min))); paint(); }, pixels: 220, label: function () { return label; }, text: function () { return String(Math.round(cur())); } });
