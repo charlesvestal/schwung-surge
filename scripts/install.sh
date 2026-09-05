@@ -16,8 +16,16 @@ echo "=== Installing Surge XT Module ==="
 
 # Deploy to Move
 echo "Copying module to Move..."
-ssh ableton@move.local "mkdir -p /data/UserData/schwung/modules/sound_generators/surge"
-scp -r dist/surge/* ableton@move.local:/data/UserData/schwung/modules/sound_generators/surge/
+DEST=/data/UserData/schwung/modules/sound_generators/surge
+ssh ableton@move.local "mkdir -p $DEST"
+# dsp.so goes over as a NEW file and is renamed into place: writing straight
+# onto a mapped .so corrupts the copy a loaded slot is running. Everything
+# else can be copied in place.
+scp dist/surge/dsp.so ableton@move.local:$DEST/dsp.so.new
+for f in dist/surge/*; do
+    case "$(basename "$f")" in dsp.so) ;; *) scp -r "$f" ableton@move.local:$DEST/ ;; esac
+done
+ssh ableton@move.local "mv -f $DEST/dsp.so.new $DEST/dsp.so"
 
 # Install chain presets if they exist
 if [ -d "src/chain_patches" ]; then
