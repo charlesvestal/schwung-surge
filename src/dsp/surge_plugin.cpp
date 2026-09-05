@@ -19,6 +19,13 @@
 #include <cctype>
 #include <vector>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <optional>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* Plugin API definitions */
 extern "C" {
@@ -64,6 +71,9 @@ typedef plugin_api_v2_t* (*move_plugin_init_v2_fn)(const host_api_v1_t *host);
 #include "SurgeSynthesizer.h"
 #include "SurgeStorage.h"
 #include "Parameter.h"
+#include "Oscillator.h"
+#include "sst/filters.h"
+#include <sst/filters/HalfRateFilter.h>
 
 /* Surge block size is 32, Move block size is 128, so we call process() 4 times */
 static_assert(MOVE_FRAMES_PER_BLOCK % BLOCK_SIZE == 0,
@@ -87,10 +97,13 @@ public:
  * Parameter registry - maps string keys to Surge parameter IDs
  * ===================================================================== */
 
-#define MAX_SURGE_PARAMS 300
+/* Every Surge parameter: 273 per scene x 2 scenes + 219 global (11 + 16 FX
+ * slots x 13). Scene A comes FIRST in the registry, as it always did, so the
+ * mod-slot destination indices in saved states keep meaning what they meant. */
+#define MAX_SURGE_PARAMS 1024
 
 struct surge_param_entry {
-    char key[48];             /* Parameter key, e.g. "osc1_pitch" */
+    char key[48];             /* Parameter key, e.g. "osc1_pitch", "b_osc1_pitch", "fx0_p3", "g_volume" */
     char display_name[48];    /* Display name, e.g. "Osc 1 Pitch" */
     SurgeSynthesizer::ID surge_id;
     int valtype;              /* 0=int, 1=bool, 2=float */
@@ -98,7 +111,13 @@ struct surge_param_entry {
     float max_val;
     char options_json[4096];
     int param_id_in_scene;
+    int ctrltype;             /* Surge ctrltypes */
+    int scene;                /* 0 global, 1 A, 2 B */
+    int ctrlgroup;            /* Surge ControlGroup */
+    int ctrlgroup_entry;
 };
+
+struct RemoteFiles;
 
 /* =====================================================================
  * Instance structure
@@ -146,6 +165,11 @@ typedef struct {
     /* Pre-built JSON strings */
     char *ui_hierarchy_json;
     char *chain_params_json;
+
+    /* Remote UI: the file-writer thread, and the lock the registry needs now
+     * that the writer may re-populate it while the host reads it. */
+    RemoteFiles *remote;
+    std::mutex *reg_mtx;
 
     /* Auto BPM Sync */
     bool sync_bpm;
@@ -201,80 +225,108 @@ static int json_get_string(const char *json, const char *key, char *out, int out
  * Parameter registry population
  * ===================================================================== */
 
+static void remote_request(surge_instance_t *inst, unsigned bits);
+enum { RF_PARAMS = 1, RF_PRESETS = 2, RF_WAVES = 4, RF_FILTERS = 8, RF_REPOP = 16 };
+
+static void register_one(surge_instance_t *inst, Parameter *p, int i) {
+    SurgeSynthesizer::ID id;
+    if (!inst->synth->fromSynthSideId(i, id)) return;
+    if (inst->param_count >= MAX_SURGE_PARAMS) return;
+    /* Surge's global fx_disable is an int bitmask with a range of INT_MIN..INT_MAX
+     * and no control type: not a control, and a range no option list can walk.
+     * (The 32-bit difference of that range overflowed to -1, passed a "< 128"
+     * check, and the option loop below then ran until std::bad_alloc took the
+     * whole Move process down -- 2026-09-05.) Scene A keeps its ct_none entries,
+     * because their positions are what saved mod-slot destinations index. */
+    if (p->ctrltype == ct_none && p->scene == 0 && p->ctrlgroup != cg_FX) return;
+    surge_param_entry *entry = &inst->params[inst->param_count];
+
+    /* KEYS. Scene A keeps its historical bare names ("osc1_pitch"): they are in
+     * saved states, in chain_params and in the device UI. Scene B keeps Surge's
+     * own "b_" prefix. Global parameters take "g_", except the FX slots, whose
+     * storage names ("type", "p0") repeat per slot and are keyed by slot:
+     * "fx<slot>_type", "fx<slot>_p<n>", slot in fxslot_positions order. */
+    const char *sname = p->get_storage_name();
+    if (p->scene == 1 && sname[0] == 'a' && sname[1] == '_') snprintf(entry->key, sizeof(entry->key), "%s", sname + 2);
+    else if (p->scene == 2) snprintf(entry->key, sizeof(entry->key), "%s", sname);
+    else if (p->ctrlgroup == cg_FX) {
+        /* Surge's storage name already carries a ONE-based slot ("fx1_type",
+         * "fx1_p0"); the key carries the zero-based slot index the page and
+         * fxslot_positions use, and the rest of the name as Surge spells it. */
+        const char *rest = strchr(sname, '_');
+        snprintf(entry->key, sizeof(entry->key), "fx%d_%s", p->ctrlgroup_entry, rest ? rest + 1 : sname);
+    } else snprintf(entry->key, sizeof(entry->key), "g_%s", sname);
+
+    const char *fname = p->get_full_name();
+    strncpy(entry->display_name, fname, sizeof(entry->display_name) - 1);
+    entry->display_name[sizeof(entry->display_name) - 1] = '\0';
+
+    entry->surge_id = id;
+    entry->valtype = p->valtype;
+    entry->min_val = (p->valtype == 2) ? p->val_min.f : (float)p->val_min.i;
+    entry->max_val = (p->valtype == 2) ? p->val_max.f : (float)p->val_max.i;
+    entry->options_json[0] = '\0';
+    entry->param_id_in_scene = p->param_id_in_scene;
+    entry->ctrltype = (int)p->ctrltype;
+    entry->scene = p->scene;
+    entry->ctrlgroup = (int)p->ctrlgroup;
+    entry->ctrlgroup_entry = p->ctrlgroup_entry;
+    if (strcmp(entry->key, "ws_type") == 0) {
+        std::string opts = "[";
+        opts += "\"Off\",\"Soft\",\"Hard\",\"Asymmetric\",\"Sine\",\"Digital\",\"OJD\",\"Fuzz\",\"Fuzz+Octave\",";
+        opts += "\"K35\",\"Distortion\",\"Distortion+Asym\",\"Tube\",\"Tube2\",\"Clip\",\"Fold\",\"Waveshaper\",\"S-Curve\",";
+        opts += "\"Sinusoid\",\"Chebyshev\",\"Chebyshev2\",\"Chebyshev3\",\"Chebyshev4\",\"Chebyshev5\",\"Chebyshev6\",";
+        opts += "\"Symmetric Clip\",\"Symmetric Fold\",\"Asymmetric Clip\",\"Asymmetric Fold\",\"Soft Clip\",\"Soft Fold\",";
+        opts += "\"Hard Clip\",\"Hard Fold\",\"Wavefolder\",\"Wavefolder 2\",\"Wavefolder 3\",\"Wavefolder 4\",\"Wavefolder 5\",";
+        opts += "\"Wavefolder 6\",\"Bitcrusher\",\"Bitcrusher 2\",\"Sample & Hold\",\"Decimator\",\"Slew Rate Limiter\"";
+        opts += "]";
+        strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
+    } else if ((p->valtype == 0 || p->valtype == 1) && p->ctrltype != ct_filtersubtype && p->ctrltype != ct_none) {
+        const int min_val = p->val_min.i;
+        const int max_val = p->val_max.i;
+        const long long span = (long long)max_val - (long long)min_val; /* never int: INT_MIN..INT_MAX exists */
+        if (span > 0 && span < 128) {
+            std::string opts = "[";
+            for (int v = min_val; v <= max_val; v++) {
+                if (v > min_val) opts += ",";
+                float ef = (max_val > min_val) ? (float)(v - min_val) / (float)(max_val - min_val) : 0.0f;
+                std::string s = p->get_display(true, ef);
+                std::string esc;
+                for (char c : s) {
+                    if (c == '"') esc += "\\\"";
+                    else if (c == '\\') esc += "\\\\";
+                    else esc += c;
+                }
+                opts += "\"" + esc + "\"";
+            }
+            opts += "]";
+            strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
+        }
+    }
+    inst->param_count++;
+}
+
 static void populate_param_registry(surge_instance_t *inst) {
     if (!inst->synth) return;
+    std::lock_guard<std::mutex> g(*inst->reg_mtx);
 
     auto &patch = inst->synth->storage.getPatch();
     int n_params = (int)patch.param_ptr.size();
     inst->param_count = 0;
 
-    for (int i = 0; i < n_params && inst->param_count < MAX_SURGE_PARAMS; i++) {
-        Parameter *p = patch.param_ptr[i];
-        if (!p) continue;
-        if (p->scene != 1) continue; /* Scene A only */
-
-        SurgeSynthesizer::ID id;
-        if (!inst->synth->fromSynthSideId(i, id)) continue;
-
-        surge_param_entry *entry = &inst->params[inst->param_count];
-
-        /* Key = storage name minus "a_" prefix */
-        const char *sname = p->get_storage_name();
-        if (sname[0] == 'a' && sname[1] == '_') {
-            strncpy(entry->key, sname + 2, sizeof(entry->key) - 1);
-        } else {
-            strncpy(entry->key, sname, sizeof(entry->key) - 1);
+    /* Three passes so the order is Scene A, Scene B, global -- Scene A first
+     * because mod-slot destinations in saved states are registry INDICES. */
+    for (int pass = 0; pass < 3; pass++) {
+        const int want = pass == 0 ? 1 : pass == 1 ? 2 : 0;
+        for (int i = 0; i < n_params; i++) {
+            Parameter *p = patch.param_ptr[i];
+            if (!p || p->scene != want) continue;
+            register_one(inst, p, i);
         }
-        entry->key[sizeof(entry->key) - 1] = '\0';
-
-        /* Display name from full name */
-        const char *fname = p->get_full_name();
-        strncpy(entry->display_name, fname, sizeof(entry->display_name) - 1);
-        entry->display_name[sizeof(entry->display_name) - 1] = '\0';
-
-        entry->surge_id = id;
-        entry->valtype = p->valtype;
-        entry->min_val = (p->valtype == 2) ? p->val_min.f : (float)p->val_min.i;
-        entry->max_val = (p->valtype == 2) ? p->val_max.f : (float)p->val_max.i;
-        entry->options_json[0] = '\0';
-        entry->param_id_in_scene = p->param_id_in_scene;
-                if (strcmp(entry->key, "ws_type") == 0) {
-            std::string opts = "[";
-            opts += "\"Off\",\"Soft\",\"Hard\",\"Asymmetric\",\"Sine\",\"Digital\",\"OJD\",\"Fuzz\",\"Fuzz+Octave\",";
-            opts += "\"K35\",\"Distortion\",\"Distortion+Asym\",\"Tube\",\"Tube2\",\"Clip\",\"Fold\",\"Waveshaper\",\"S-Curve\",";
-            opts += "\"Sinusoid\",\"Chebyshev\",\"Chebyshev2\",\"Chebyshev3\",\"Chebyshev4\",\"Chebyshev5\",\"Chebyshev6\",";
-            opts += "\"Symmetric Clip\",\"Symmetric Fold\",\"Asymmetric Clip\",\"Asymmetric Fold\",\"Soft Clip\",\"Soft Fold\",";
-            opts += "\"Hard Clip\",\"Hard Fold\",\"Wavefolder\",\"Wavefolder 2\",\"Wavefolder 3\",\"Wavefolder 4\",\"Wavefolder 5\",";
-            opts += "\"Wavefolder 6\",\"Bitcrusher\",\"Bitcrusher 2\",\"Sample & Hold\",\"Decimator\",\"Slew Rate Limiter\"";
-            opts += "]";
-            strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
-        } else if ((p->valtype == 0 || p->valtype == 1) && p->ctrltype != ct_filtersubtype) {
-            int min_val = p->val_min.i;
-            int max_val = p->val_max.i;
-            if (max_val > min_val && max_val - min_val < 128) {
-                std::string opts = "[";
-                for (int v = min_val; v <= max_val; v++) {
-                    if (v > min_val) opts += ",";
-                    float ef = (max_val > min_val) ? (float)(v - min_val) / (float)(max_val - min_val) : 0.0f;
-                    std::string s = p->get_display(true, ef);
-                    std::string esc;
-                    for (char c : s) {
-                        if (c == '"') esc += "\\\"";
-                        else if (c == '\\') esc += "\\\\";
-                        else esc += c;
-                    }
-                    opts += "\"" + esc + "\"";
-                }
-                opts += "]";
-                strncpy(entry->options_json, opts.c_str(), sizeof(entry->options_json) - 1);
-            }
-        }
-
-        inst->param_count++;
     }
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Registered %d Scene A parameters", inst->param_count);
+    snprintf(msg, sizeof(msg), "Registered %d parameters (all scenes, global, FX)", inst->param_count);
     plugin_log(msg);
 }
 
@@ -379,6 +431,7 @@ static const char* get_current_preset_category(surge_instance_t *inst) {
 
 /* Find a parameter entry by key */
 static surge_param_entry* find_param(surge_instance_t *inst, const char *key) {
+    std::lock_guard<std::mutex> g(*inst->reg_mtx);
     for (int i = 0; i < inst->param_count; i++) {
         if (strcmp(inst->params[i].key, key) == 0) {
             return &inst->params[i];
@@ -433,6 +486,7 @@ static void load_preset_by_display_index(surge_instance_t *inst, int display_idx
             if (mr.depth != 0.0f && !mr.muted) {
                 int dest_idx = 0;
                 for (int p = 0; p < inst->param_count; p++) {
+                    if (L < 2 && inst->params[p].scene != 1) continue;
                     long target_id = (L == 2) ? inst->params[p].surge_id.getSynthSideId() : inst->params[p].param_id_in_scene;
                     if (target_id == mr.destination_id) {
                         dest_idx = p + 1;
@@ -469,6 +523,445 @@ static void load_preset_by_display_index(surge_instance_t *inst, int display_idx
             }
         }
     }
+    remote_request(inst, RF_PARAMS | RF_WAVES | RF_FILTERS);
+}
+
+/* =====================================================================
+ * Remote UI files
+ *
+ * The Remote UI (web_ui.html) sees the module through Schwung Manager,
+ * which hands a browser two things: our `state` blob, flattened one field per
+ * key, and `chain_params`. Both live inside the host's 64 KB parameter
+ * buffer -- and chain_params, with Scene A alone, is already 60.8 KB of it.
+ * So every VALUE goes through `state` (every registered parameter and the
+ * macros, ~25 KB), and everything else the page needs is written to files
+ * under <module_dir>/remote/, which the manager serves verbatim through its
+ * module-assets route:
+ *
+ *   patch_params.json   every parameter: key, names, group, control type,
+ *                       range, default, and Surge's own displayInfo, so the
+ *                       page reproduces Parameter::get_display exactly instead
+ *                       of guessing units. Rewritten on every preset load and
+ *                       after any type change, because oscillator and FX
+ *                       parameters change name, type and range with the type.
+ *   presets_index.json  the patch list in display order, grouped by category.
+ *   waves.json          a rendered cycle of each oscillator, the way Surge's
+ *                       own waveform display renders it (spawn_osc + a block
+ *                       loop), for both scenes.
+ *   filters.json        the measured magnitude response of each filter, the
+ *                       way Surge's filter analysis measures it (a log sweep
+ *                       through the real filter unit).
+ *
+ * All of it is built and written on ONE worker thread, never on the host's
+ * parameter thread or the audio thread; requests only set bits and poke a
+ * condition variable. Writes go to a temp name and are renamed, so a browser
+ * fetching mid-write sees the old file or the new one. Each file carries a
+ * `rev` so the page can tell a fresh answer from a stale one.
+ * ===================================================================== */
+
+/* RF_PARAMS patch_params.json, RF_PRESETS presets_index.json, RF_WAVES
+ * waves.json, RF_FILTERS filters.json, RF_REPOP: re-populate the registry
+ * first (a type changed). Declared beside the registry above. */
+
+struct RemoteFiles {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    unsigned pending = 0;
+    bool quit = false;
+    int rev = 0;
+};
+
+static void remote_request(surge_instance_t *inst, unsigned bits) {
+    if (!inst || !inst->remote) return;
+    { std::lock_guard<std::mutex> g(inst->remote->m); inst->remote->pending |= bits; }
+    inst->remote->cv.notify_one();
+}
+
+static void jstr(std::string &out, const char *s) {
+    out += '"';
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { out += '\\'; out += (char)*p; }
+        else if (*p < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", *p); out += b; }
+        else out += (char)*p;
+    }
+    out += '"';
+}
+static void jnum(std::string &out, double v) {
+    char b[40];
+    if (!std::isfinite(v)) { out += "null"; return; }
+    /* nine significant digits: every float survives the round trip. Six lost
+     * the tail of displayInfo.b (1/12) and moved a cutoff readout by 0.04 Hz. */
+    snprintf(b, sizeof(b), "%.9g", v);
+    out += b;
+}
+
+static bool remote_write(surge_instance_t *inst, const char *name, const std::string &body) {
+    char dir[512], tmp[600], path[600];
+    snprintf(dir, sizeof(dir), "%s/remote", inst->module_dir);
+    mkdir(dir, 0777);
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return false;
+    const bool ok = fwrite(body.data(), 1, body.size(), f) == body.size();
+    if (fclose(f) != 0 || !ok || rename(tmp, path) != 0) { unlink(tmp); return false; }
+    return true;
+}
+
+/* patch_params.json: the registry plus Surge's display description of each
+ * parameter, the macros with their labels, the wavetable names, and the
+ * patch's modulation routings. */
+struct RegSnap { char key[48]; long sid; int scene, pid; };
+static void remote_write_params(surge_instance_t *inst) {
+    std::string j;
+    j.reserve(400000);
+    /* Copy what the file needs of the registry and let go of the lock: the
+     * host's parameter thread takes it for every find_param, and formatting
+     * eight hundred parameters is tens of milliseconds it must not wait. */
+    std::vector<RegSnap> reg;
+    {
+        std::lock_guard<std::mutex> g(*inst->reg_mtx);
+        reg.resize(inst->param_count);
+        for (int i = 0; i < inst->param_count; i++) {
+            const surge_param_entry &e = inst->params[i];
+            memcpy(reg[i].key, e.key, sizeof(reg[i].key));
+            reg[i].sid = e.surge_id.getSynthSideId();
+            reg[i].scene = e.scene;
+            reg[i].pid = e.param_id_in_scene;
+        }
+    }
+    auto &storage = inst->synth->storage;
+    auto &patch = storage.getPatch();
+    j += "{\"rev\":" + std::to_string(++inst->remote->rev);
+    j += ",\"preset\":" + std::to_string(inst->current_preset);
+    j += ",\"preset_name\":"; jstr(j, inst->preset_name);
+    j += ",\"category\":"; jstr(j, get_current_preset_category(inst));
+    j += ",\"macros\":[";
+    for (int i = 0; i < n_customcontrollers; i++) {
+        if (i) j += ",";
+        j += "{\"key\":\"macro" + std::to_string(i + 1) + "\",\"label\":"; jstr(j, patch.CustomControllerLabel[i]); j += "}";
+    }
+    j += "],\"wavetables\":[";
+    for (int s = 0; s < n_scenes; s++) {
+        j += s ? ",[" : "[";
+        for (int o = 0; o < n_oscs; o++) { if (o) j += ","; jstr(j, patch.scene[s].osc[o].wavetable_display_name.c_str()); }
+        j += "]";
+    }
+    j += "],\"params\":[";
+    bool firstP = true;
+    for (size_t i = 0; i < reg.size(); i++) {
+        const RegSnap &e = reg[i];
+        const long sid = e.sid;
+        if (sid < 0 || sid >= (long)patch.param_ptr.size()) continue;
+        const Parameter *p = patch.param_ptr[sid];
+        if (!p) continue;
+        if (!firstP) j += ",";
+        firstP = false;
+        j += "{\"k\":"; jstr(j, e.key);
+        j += ",\"n\":"; jstr(j, p->get_full_name());
+        j += ",\"s\":"; jstr(j, p->get_name());
+        j += ",\"sc\":" + std::to_string(p->scene) + ",\"g\":" + std::to_string((int)p->ctrlgroup) + ",\"ge\":" + std::to_string(p->ctrlgroup_entry);
+        j += ",\"ct\":" + std::to_string((int)p->ctrltype) + ",\"vt\":" + std::to_string(p->valtype);
+        j += ",\"min\":"; jnum(j, p->valtype == vt_float ? p->val_min.f : (double)p->val_min.i);
+        j += ",\"max\":"; jnum(j, p->valtype == vt_float ? p->val_max.f : (double)p->val_max.i);
+        j += ",\"def\":"; jnum(j, p->valtype == vt_float ? p->val_default.f : (p->valtype == vt_bool ? (double)p->val_default.b : (double)p->val_default.i));
+        j += std::string(",\"bip\":") + (p->is_bipolar() ? "true" : "false");
+        j += std::string(",\"ext\":") + (p->can_extend_range() ? "true" : "false") + ",\"xr\":" + (p->extend_range ? "true" : "false");
+        j += std::string(",\"ts\":") + (p->can_temposync() ? "true" : "false") + ",\"tsn\":" + (p->temposync ? "true" : "false");
+        j += std::string(",\"ab\":") + (p->can_be_absolute() ? "true" : "false") + ",\"abs\":" + (p->absolute ? "true" : "false");
+        j += std::string(",\"da\":") + (p->can_deactivate() ? "true" : "false") + ",\"dv\":" + (p->deactivated ? "true" : "false");
+        j += ",\"dt\":" + std::to_string((int)p->displayType);
+        const auto &d = p->displayInfo;
+        j += ",\"d\":{\"u\":"; jstr(j, d.unit); j += ",\"au\":"; jstr(j, d.absoluteUnit);
+        j += ",\"sc\":"; jnum(j, d.scale); j += ",\"a\":"; jnum(j, d.a); j += ",\"b\":"; jnum(j, d.b);
+        j += ",\"dec\":" + std::to_string(d.decimals) + ",\"f\":" + std::to_string((long long)d.customFeatures);
+        j += ",\"minL\":"; jstr(j, d.minLabel); j += ",\"maxL\":"; jstr(j, d.maxLabel); j += ",\"defL\":"; jstr(j, d.defLabel);
+        j += ",\"minV\":"; jnum(j, d.minLabelValue); j += ",\"maxV\":"; jnum(j, d.maxLabelValue);
+        j += ",\"absF\":"; jnum(j, d.absoluteFactor); j += ",\"tsm\":"; jnum(j, d.tempoSyncNotationMultiplier);
+        j += std::string(",\"nn\":") + (d.supportsNoteName ? "true" : "false") + "}";
+        if (p->valtype != vt_float) {
+            /* every option, spelled by Surge itself, for ranges a menu can hold */
+            const int lo = p->val_min.i, hi = p->val_max.i;
+            const long long span = (long long)hi - (long long)lo;
+            if (p->ctrltype != ct_none && span >= 0 && span < 256) {
+                j += ",\"o\":[";
+                for (int v = lo; v <= hi; v++) {
+                    if (v > lo) j += ",";
+                    const float ef = hi > lo ? (float)(v - lo) / (float)(hi - lo) : 0.f;
+                    jstr(j, p->get_display(true, ef).c_str());
+                }
+                j += "]";
+            }
+        } else if (p->displayType == Parameter::Custom || p->basicBlocksParamMetaData.has_value()) {
+            /* the few float types Surge formats by hand: sample its own text */
+            j += ",\"tbl\":[";
+            for (int t = 0; t <= 64; t++) { if (t) j += ","; jstr(j, p->get_display(true, (float)t / 64.f).c_str()); }
+            j += "]";
+        } else {
+            /* five reference points of Surge's own text, so the page's port of
+             * get_display can be checked against the real thing on every build */
+            j += ",\"chk\":[";
+            for (int t = 0; t < 5; t++) { if (t) j += ","; jstr(j, p->get_display(true, (float)t / 4.f).c_str()); }
+            j += "]";
+        }
+        j += "}";
+    }
+    j += "],\"routings\":[";
+    bool first = true;
+    auto emit = [&](const ModulationRouting &mr, int scene, const char *kind) {
+        int idx = -1;
+        for (size_t i = 0; i < reg.size(); i++) {
+            const RegSnap &e = reg[i];
+            if (scene >= 0) { if (e.scene == scene + 1 && e.pid == mr.destination_id) { idx = (int)i; break; } }
+            else if (e.sid == mr.destination_id) { idx = (int)i; break; }
+        }
+        if (idx < 0) return;
+        const int src_scene = mr.source_scene >= 0 ? mr.source_scene : (scene >= 0 ? scene : 0);
+        const float depth = inst->synth->getModDepth01(reg[idx].sid, (modsources)mr.source_id, src_scene, mr.source_index);
+        if (!first) j += ",";
+        first = false;
+        j += "{\"src\":" + std::to_string(mr.source_id) + ",\"srcn\":"; jstr(j, modsource_names[mr.source_id]);
+        j += ",\"si\":" + std::to_string(mr.source_index) + ",\"ss\":" + std::to_string(src_scene);
+        j += ",\"dst\":"; jstr(j, reg[idx].key);
+        j += ",\"depth\":"; jnum(j, depth);
+        j += std::string(",\"muted\":") + (mr.muted ? "true" : "false") + ",\"kind\":\"" + kind + "\"}";
+    };
+    for (int s = 0; s < n_scenes; s++) {
+        for (const auto &mr : patch.scene[s].modulation_voice) emit(mr, s, "voice");
+        for (const auto &mr : patch.scene[s].modulation_scene) emit(mr, s, "scene");
+    }
+    for (const auto &mr : patch.modulation_global) emit(mr, -1, "global");
+    j += "]}\n";
+    remote_write(inst, "patch_params.json", j);
+}
+
+/* presets_index.json: every patch in display order, grouped by category. */
+static void remote_write_presets(surge_instance_t *inst) {
+    auto &storage = inst->synth->storage;
+    std::string j;
+    j.reserve(120000);
+    j += "{\"rev\":" + std::to_string(++inst->remote->rev) + ",\"count\":" + std::to_string((int)storage.patchOrdering.size()) + ",\"categories\":[";
+    int lastCat = -2;
+    bool firstCat = true, firstP = true;
+    for (size_t i = 0; i < storage.patchOrdering.size(); i++) {
+        const int raw = storage.patchOrdering[i];
+        if (raw < 0 || raw >= (int)storage.patch_list.size()) continue;
+        const Patch &pt = storage.patch_list[raw];
+        if (pt.category != lastCat) {
+            if (lastCat != -2) j += "]}";
+            lastCat = pt.category;
+            std::string cname = "Uncategorised";
+            auto it = inst->category_id_to_name->find(pt.category);
+            if (it != inst->category_id_to_name->end()) cname = it->second;
+            const char *kind = pt.category >= storage.firstUserCategory ? "user"
+                             : pt.category >= storage.firstThirdPartyCategory ? "thirdparty" : "factory";
+            j += firstCat ? "{" : ",{"; firstCat = false;
+            j += "\"name\":"; jstr(j, cname.c_str()); j += ",\"kind\":\""; j += kind; j += "\",\"presets\":[";
+            firstP = true;
+        }
+        if (!firstP) j += ",";
+        firstP = false;
+        j += "{\"i\":" + std::to_string((int)i) + ",\"n\":"; jstr(j, pt.name.c_str());
+        if (pt.isFavorite) j += ",\"fav\":true";
+        j += "}";
+    }
+    if (lastCat != -2) j += "]}";
+    j += "]}\n";
+    remote_write(inst, "presets_index.json", j);
+}
+
+/* waves.json: one rendered cycle-run per oscillator, rendered exactly as
+ * Surge's OscillatorWaveformDisplay renders it -- a spawned oscillator at the
+ * display pitch, processed in oversampled blocks, halved by the half-rate
+ * filter, then averaged four to a point. 512 points per oscillator. */
+static void remote_write_waves(surge_instance_t *inst) {
+    auto &storage = inst->synth->storage;
+    auto &patch = storage.getPatch();
+    std::string j;
+    j.reserve(60000);
+    j += "{\"rev\":" + std::to_string(++inst->remote->rev) + ",\"scenes\":[";
+    static unsigned char oscbuffer alignas(16)[oscillator_buffer_size];
+    static pdata tp[n_scene_params];
+    const float disp_pitch = 90.15f - 48.f;
+    const float pitch = disp_pitch + 12.0f * log2f((float)storage.dsamplerate / 44100.0f);
+    for (int s = 0; s < n_scenes; s++) {
+        j += s ? ",[" : "[";
+        for (int o = 0; o < n_oscs; o++) {
+            OscillatorStorage *od = &patch.scene[s].osc[o];
+            const int type = od->type.val.i;
+            if (o) j += ",";
+            j += "{\"type\":" + std::to_string(type) + ",\"name\":"; jstr(j, osc_type_names[type]);
+            j += ",\"wt\":"; jstr(j, od->wavetable_display_name.c_str());
+            memset(tp, 0, sizeof(tp));
+            tp[od->pitch.param_id_in_scene].f = 0;
+            for (int i = 0; i < n_osc_params; i++) tp[od->p[i].param_id_in_scene].i = od->p[i].val.i;
+            Oscillator *osc = spawn_osc(type, &storage, od, tp, tp, oscbuffer);
+            j += ",\"w\":[";
+            if (osc) {
+                const bool disp = osc->allow_display();
+                if (disp) osc->init(pitch, true, true);
+                float tmp alignas(16)[2][BLOCK_SIZE_OS];
+                sst::filters::HalfRate::HalfRateFilter hr(6, true);
+                hr.load_coefficients(); hr.reset();
+                int block_pos = BLOCK_SIZE, n = 0;
+                const int POINTS = 512, AVG = 4;
+                for (int i = 0; i < POINTS; i++) {
+                    float v = 0.f;
+                    if (disp) {
+                        for (int a = 0; a < AVG; a++) {
+                            if (block_pos >= BLOCK_SIZE) {
+                                storage.waveTableDataMutex.lock();
+                                osc->process_block(pitch);
+                                memcpy(tmp[0], osc->output, sizeof(tmp[0]));
+                                memcpy(tmp[1], osc->output, sizeof(tmp[1]));
+                                hr.process_block_D2(tmp[0], tmp[1], BLOCK_SIZE_OS);
+                                storage.waveTableDataMutex.unlock();
+                                block_pos = 0;
+                            }
+                            v += tmp[0][block_pos++];
+                        }
+                        v /= AVG;
+                    }
+                    if (n++) j += ",";
+                    char b[16]; snprintf(b, sizeof(b), "%.3f", v); j += b;
+                }
+                osc->~Oscillator();
+            }
+            j += "]}";
+        }
+        j += "]";
+    }
+    j += "]}\n";
+    remote_write(inst, "waves.json", j);
+}
+
+/* filters.json: the magnitude response of each filter unit, measured the way
+ * Surge's Filter Analysis measures it -- a logarithmic sine sweep through the
+ * real quad filter unit with the real coefficient maker -- and read at 96
+ * log-spaced frequencies by Goertzel (the analysis uses JUCE's FFT, which the
+ * headless build does not have). Type 0 (Off) writes null. */
+static void remote_write_filters(surge_instance_t *inst) {
+    auto &storage = inst->synth->storage;
+    auto &patch = storage.getPatch();
+    const int N = 16384, NF = 96;
+    const float SR = 44100.f, F0 = 20.f, F1 = 20000.f;
+    static std::vector<float> sweep, out;
+    sweep.assign(N, 0.f); out.assign(N, 0.f);
+    const float beta = (float)N / std::log(F1 / F0);
+    for (int i = 0; i < N; i++) {
+        const float phase = 2.f * (float)M_PI * beta * F0 * (std::pow(F1 / F0, (float)i / (float)N) - 1.f);
+        sweep[i] = 0.70710678f * std::sin((phase + (float)M_PI / 180.f) / SR);
+    }
+    std::vector<float> hz(NF);
+    for (int k = 0; k < NF; k++) hz[k] = F0 * std::pow(F1 / F0, (float)k / (NF - 1));
+    auto goertzel = [&](const std::vector<float> &x, float f) {
+        const double w = 2.0 * M_PI * f / SR, c = 2.0 * cos(w);
+        double s0, s1 = 0, s2 = 0;
+        for (int i = 0; i < N; i++) { s0 = x[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+        const double re = s1 - s2 * cos(w), im = s2 * sin(w);
+        return sqrt(re * re + im * im);
+    };
+    std::vector<double> xm(NF);
+    for (int k = 0; k < NF; k++) xm[k] = goertzel(sweep, hz[k]);
+    std::string j;
+    j.reserve(20000);
+    j += "{\"rev\":" + std::to_string(++inst->remote->rev) + ",\"hz\":[";
+    for (int k = 0; k < NF; k++) { if (k) j += ","; jnum(j, hz[k]); }
+    j += "],\"scenes\":[";
+    for (int s = 0; s < n_scenes; s++) {
+        j += s ? ",[" : "[";
+        for (int f = 0; f < n_filterunits_per_scene; f++) {
+            auto &fu = patch.scene[s].filterunit[f];
+            int type = fu.type.val.i, sub = fu.subtype.val.i;
+            if (type < 0 || type >= sst::filters::num_filter_types) type = 0;
+            /* a type switch lands before its subtype is clamped by Surge */
+            if (sub < 0) sub = 0;
+            if (sub >= sst::filters::fut_subcount[type]) sub = sst::filters::fut_subcount[type] > 0 ? sst::filters::fut_subcount[type] - 1 : 0;
+            if (f) j += ",";
+            j += "{\"type\":" + std::to_string(type) + ",\"sub\":" + std::to_string(sub) + ",\"cutoff\":"; jnum(j, fu.cutoff.val.f);
+            j += ",\"res\":"; jnum(j, fu.resonance.val.f); j += ",\"db\":";
+            auto fptr = sst::filters::GetQFPtrFilterUnit((sst::filters::FilterType)type, (sst::filters::FilterSubType)sub);
+            if (type == 0 || !fptr) { j += "null}"; continue; }
+            static float delayBuffer[4][sst::filters::utilities::MAX_FB_COMB + sst::filters::utilities::SincTable::FIRipol_N];
+            sst::filters::QuadFilterUnitState st{};
+            for (int i = 0; i < 4; i++) st.DB[i] = &delayBuffer[i][0];
+            sst::filters::FilterCoefficientMaker<> cm;
+            cm.setSampleRateAndBlockSize(SR, 512);
+            cm.MakeCoeffs(fu.cutoff.val.f, fu.resonance.val.f, (sst::filters::FilterType)type, (sst::filters::FilterSubType)sub, nullptr, false);
+            cm.updateState(st);
+            std::fill(st.R, &st.R[sst::filters::n_filter_registers], SIMD_MM(setzero_ps)());
+            for (int i = 0; i < 4; i++) { st.WP[i] = 0; st.active[i] = 0; }
+            st.active[0] = 0xFFFFFFFF;
+            for (int i = 0; i < N; i++) {
+                auto y = fptr(&st, SIMD_MM(set_ps1)(sweep[i]));
+                float ya alignas(16)[4];
+                SIMD_MM(store_ps)(ya, y);
+                out[i] = ya[0];
+            }
+            j += "[";
+            for (int k = 0; k < NF; k++) {
+                if (k) j += ",";
+                const double ym = goertzel(out, hz[k]);
+                const double db = (xm[k] > 0 && ym > 0) ? 20.0 * log10(ym / xm[k]) : -120.0;
+                jnum(j, db);
+            }
+            j += "]}";
+        }
+        j += "]";
+    }
+    j += "]}\n";
+    remote_write(inst, "filters.json", j);
+}
+
+static void remote_thread_main(surge_instance_t *inst) {
+    RemoteFiles *r = inst->remote;
+    for (;;) {
+        unsigned bits;
+        {
+            std::unique_lock<std::mutex> l(r->m);
+            r->cv.wait(l, [&] { return r->pending || r->quit; });
+            if (r->quit) return;
+        }
+        /* coalesce a burst -- a knob drag is dozens of requests -- into one write */
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        {
+            std::lock_guard<std::mutex> g(r->m);
+            bits = r->pending; r->pending = 0;
+            if (r->quit) return;
+        }
+        if (!inst->synth) continue;
+        /* This thread lives inside Move's own process: an exception that
+         * escaped here would be std::terminate for the whole device. */
+        auto guarded = [&](const char *what, void (*fn)(surge_instance_t *)) {
+            try { fn(inst); }
+            catch (const std::exception &e) { char m[200]; snprintf(m, sizeof(m), "remote %s failed: %s", what, e.what()); plugin_log(m); }
+            catch (...) { char m[200]; snprintf(m, sizeof(m), "remote %s failed", what); plugin_log(m); }
+        };
+        if (bits & RF_REPOP) guarded("repopulate", populate_param_registry);
+        if (bits & RF_PRESETS) guarded("presets", remote_write_presets);
+        if (bits & RF_PARAMS) guarded("params", remote_write_params);
+        if (bits & RF_WAVES) guarded("waves", remote_write_waves);
+        if (bits & RF_FILTERS) guarded("filters", remote_write_filters);
+    }
+}
+
+static void remote_start(surge_instance_t *inst) {
+    inst->remote = new RemoteFiles();
+    inst->remote->th = std::thread(remote_thread_main, inst);
+}
+static void remote_stop(surge_instance_t *inst) {
+    if (!inst->remote) return;
+    { std::lock_guard<std::mutex> g(inst->remote->m); inst->remote->quit = true; }
+    inst->remote->cv.notify_one();
+    if (inst->remote->th.joinable()) inst->remote->th.join();
+    delete inst->remote;
+    inst->remote = nullptr;
+}
+
+/* Which control types change OTHER parameters' names, types and ranges. */
+static bool is_type_ctrl(int ct) {
+    return ct == ct_osctype || ct == ct_fxtype || ct == ct_filtertype || ct == ct_wstype || ct == ct_lfotype;
 }
 
 /* =====================================================================
@@ -791,7 +1284,11 @@ static void build_chain_params(surge_instance_t *inst) {
         ",{\"key\":\"mpe_enabled\",\"short_name\":\"Enabled\",\"name\":\"MPE Enabled\",\"type\":\"int\",\"min\":0,\"max\":1}"
         ",{\"key\":\"mpe_pitch_bend_range\",\"short_name\":\"PB Range\",\"name\":\"MPE PB Range\",\"type\":\"int\",\"min\":1,\"max\":96}");
 
+    /* SCENE A ONLY, exactly as before the registry grew: chain_params must fit
+     * the host's 64 KB parameter buffer and Scene A alone is 60.8 KB of it. The
+     * Remote UI takes its metadata from patch_params.json instead. */
     for (int i = 0; i < inst->param_count && offset < bufsize - 200; i++) {
+        if (inst->params[i].scene != 1) continue;
         const char *type_str = (inst->params[i].valtype == 2) ? "float" :
                                (inst->params[i].valtype == 1) ? "int" : "int";
         if (inst->params[i].options_json[0] != '\0') {
@@ -824,6 +1321,7 @@ static void build_chain_params(surge_instance_t *inst) {
     std::string dest_opts = "[\"none\"";
     for (int i = 0; i < inst->param_count; i++) {
         // avoid some settings to keep the JSON size down
+        if (inst->params[i].scene != 1) continue;
         if (strncmp(inst->params[i].key, "mod_", 4) == 0) continue;
         dest_opts += ",\"";
         dest_opts += inst->params[i].key;
@@ -858,6 +1356,8 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (!inst) return nullptr;
 
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
+    inst->reg_mtx = new std::mutex();
+    inst->remote = nullptr;
     inst->output_gain = 0.5f;
     inst->sync_bpm = true;
     inst->bpm = 120.0;
@@ -955,6 +1455,10 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     build_ui_hierarchy(inst);
     build_chain_params(inst);
 
+    /* The Remote UI's files, on their own thread */
+    remote_start(inst);
+    remote_request(inst, RF_PRESETS | RF_PARAMS | RF_WAVES | RF_FILTERS);
+
     snprintf(msg, sizeof(msg), "Instance created: %d patches, %d categories, %d params",
              inst->preset_count, (int)inst->categories->size(), inst->param_count);
     plugin_log(msg);
@@ -966,8 +1470,10 @@ static void v2_destroy_instance(void *instance) {
     surge_instance_t *inst = (surge_instance_t*)instance;
     if (!inst) return;
 
+    remote_stop(inst);
     free(inst->ui_hierarchy_json);
     free(inst->chain_params_json);
+    delete inst->reg_mtx;
     delete inst->categories;
     delete inst->category_id_to_name;
     delete inst->synth;
@@ -1200,8 +1706,22 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 inst->synth->setParameter01(inst->params[i].surge_id, fval);
             }
         }
+        for (int m = 0; m < n_customcontrollers; m++) {
+            char mk[16]; snprintf(mk, sizeof(mk), "macro%d", m + 1);
+            if (json_get_number(val, mk, &fval) == 0) inst->synth->setMacroParameter01(m, fval < 0 ? 0 : fval > 1 ? 1 : fval);
+        }
+        remote_request(inst, RF_REPOP | RF_PARAMS | RF_WAVES | RF_FILTERS);
         return;
     }
+
+    /* Macros 1-8: Surge's assignable controllers, 0..1 */
+    if (strncmp(key, "macro", 5) == 0 && key[5] >= '1' && key[5] <= '8' && key[6] == '\0') {
+        float v = (float)atof(val);
+        inst->synth->setMacroParameter01(key[5] - '1', v < 0 ? 0 : v > 1 ? 1 : v);
+        return;
+    }
+    /* The page can ask for every file to be rewritten (e.g. after it reconnects) */
+    if (strcmp(key, "remote_refresh") == 0) { remote_request(inst, RF_REPOP | RF_PRESETS | RF_PARAMS | RF_WAVES | RF_FILTERS); return; }
 
     /* Module-level params */
     if (strcmp(key, "preset") == 0) {
@@ -1299,6 +1819,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (norm_v < 0.0f) norm_v = 0.0f;
         if (norm_v > 1.0f) norm_v = 1.0f;
         inst->synth->setParameter01(entry->surge_id, norm_v);
+        /* A type change renames and retypes its dependants (Surge applies the
+         * switch on the audio thread), so the registry is re-populated on the
+         * worker after a beat; oscillator and filter edits redraw their pictures. */
+        if (is_type_ctrl(entry->ctrltype)) remote_request(inst, RF_REPOP | RF_PARAMS | RF_WAVES | RF_FILTERS);
+        else if (entry->ctrlgroup == cg_OSC) remote_request(inst, RF_WAVES);
+        else if (entry->ctrlgroup == cg_FILTER) remote_request(inst, RF_FILTERS);
     }
 }
 
@@ -1307,6 +1833,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (!inst) return -1;
 
     /* Module-level params */
+    if (strncmp(key, "macro", 5) == 0 && key[5] >= '1' && key[5] <= '8' && key[6] == '\0' && inst->synth)
+        return snprintf(buf, buf_len, "%.6f", inst->synth->getMacroParameter01(key[5] - '1'));
     if (strcmp(key, "preset") == 0)
         return snprintf(buf, buf_len, "%d", inst->current_preset);
     if (strcmp(key, "sync_bpm") == 0)
@@ -1390,6 +1918,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             float v = inst->synth->getParameter01(inst->params[i].surge_id);
             offset += snprintf(buf + offset, buf_len - offset,
                 ",\"%s\":%.6f", inst->params[i].key, v);
+        }
+        for (int m = 0; m < n_customcontrollers && offset < buf_len - 40; m++) {
+            offset += snprintf(buf + offset, buf_len - offset,
+                ",\"macro%d\":%.6f", m + 1, inst->synth->getMacroParameter01(m));
         }
 
         for (int i = 0; i < NUM_MOD_SLOTS && offset < buf_len - 200; i++) {

@@ -67,8 +67,10 @@ target_include_directories(surge-move-plugin PRIVATE
     ${SURGE_ROOT}/libs/sst/sst-plugininfra/include
 )
 
+find_package(Threads REQUIRED)
 target_link_libraries(surge-move-plugin PRIVATE
     surge-common
+    Threads::Threads
 )
 
 # Statically link libstdc++ - the Move device has GLIBCXX up to 3.4.29

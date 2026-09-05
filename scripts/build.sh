@@ -22,6 +22,12 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         echo ""
     fi
 
+    # Regenerate the Remote UI's Surge name tables on the host (the build image
+    # has no python3); the container step only copies the result.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$REPO_ROOT/src/tools/gen_surge_meta.py"
+    fi
+
     # Run build inside container
     echo "Running build..."
     docker run --rm \
@@ -68,6 +74,14 @@ cat src/module.json > dist/surge/module.json
 cat src/ui.js > dist/surge/ui.js
 cat build/dsp.so > dist/surge/dsp.so
 chmod +x dist/surge/dsp.so
+
+# The Remote UI: web_ui.html beside module.json is what Schwung Manager looks
+# for; assets/ is served under it. surge-meta.js is generated from the pinned
+# Surge sources so it cannot disagree with the plugin (needs python3, which the
+# host has and the build image does not -- see the Docker branch above).
+rm -rf dist/surge/assets
+cp src/remote/web_ui.html dist/surge/web_ui.html
+cp -R src/remote/assets dist/surge/assets
 
 # Copy Surge factory data if available
 if [ -d "src/dsp/surge/resources/data" ]; then
