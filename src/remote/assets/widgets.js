@@ -37,6 +37,19 @@
     document.addEventListener("pointercancel", function () { pointersDown = Math.max(0, pointersDown - 1); }, true);
     function fineNow(e) { return FINE.on || (e && e.shiftKey) || pointersDown > 1; }
 
+    /* ---- the cell: label / control box / value, so a row of mixed controls lines up --
+     * The label is always two lines tall, the control box always the same height,
+     * the value always one line: knobs, switches and menus in one row share a
+     * baseline whatever their labels wrap to. */
+    function shell(cls, labelText) {
+        var el = document.createElement("div"); el.className = "cell " + cls;
+        var lab = document.createElement("div"); lab.className = "label"; lab.textContent = labelText || "";
+        var ctl = document.createElement("div"); ctl.className = "ctl";
+        var val = document.createElement("div"); val.className = "value";
+        el.appendChild(lab); el.appendChild(ctl); el.appendChild(val);
+        return { el: el, lab: lab, ctl: ctl, val: val };
+    }
+
     /* ---- relative drag on any element ---------------------------------------------- */
     /* opts: get() -> normalised, set(n), label(), text(), pixels (full range),
      * onTap(), axis: "y" | "x" | "xy" (xy returns {dx,dy}) */
@@ -155,14 +168,14 @@
     function knob(key, opts) {
         opts = opts || {};
         var p = S.byKey[key];
-        var el = document.createElement("div"); el.className = "cell knob-cell" + (opts.big ? " big" : "") + (opts.cls ? " " + opts.cls : "");
+        var sh = shell("knob-cell" + (opts.big ? " big" : "") + (opts.cls ? " " + opts.cls : ""), "");
+        var el = sh.el, lab = sh.lab, valEl = sh.val;
         var k = document.createElement("div"); k.className = "knob"; k.tabIndex = 0; k.setAttribute("role", "slider");
         var sv = svg("svg", { viewBox: "0 0 64 64" });
         sv.innerHTML = '<circle class="well" cx="32" cy="32" r="30"/><path class="track" d="' + arc(32, 32, 26, -135, 135) + '"/><path class="arc" d=""/><path class="mod" d="" visibility="hidden"/><circle class="cap" cx="32" cy="32" r="19"/><line class="ptr" x1="32" y1="30" x2="32" y2="16"/>';
         k.appendChild(sv);
         var arcEl = sv.querySelector(".arc"), ptr = sv.querySelector(".ptr"), modEl = sv.querySelector(".mod");
-        var lab = document.createElement("div"); lab.className = "label"; var valEl = document.createElement("div"); valEl.className = "value";
-        el.appendChild(lab); el.appendChild(k); el.appendChild(valEl);
+        sh.ctl.appendChild(k);
         var cur = 0;
         function angle(n) { return -135 + 270 * n; }
         function bind(pp) {
@@ -245,35 +258,41 @@
 
     /* ---- macro slider: not a Surge parameter, a 0..1 controller ------------------------ */
     function macro(i, labelText) {
+        /* a wide horizontal fader: label, rail, value on one 44 px row -- eight of
+         * them fill a panel edge to edge and nothing sits over the words */
         var key = "macro" + (i + 1);
-        var el = document.createElement("div"); el.className = "cell macro-cell";
-        var s = document.createElement("div"); s.className = "slider macro"; s.tabIndex = 0; s.setAttribute("role", "slider"); s.setAttribute("aria-label", "Macro " + (i + 1));
+        var el = document.createElement("div"); el.className = "macro-row";
+        var lab = document.createElement("div"); lab.className = "mlabel"; lab.textContent = (labelText && labelText !== "-") ? labelText : ("Macro " + (i + 1));
+        var s = document.createElement("div"); s.className = "slider macro"; s.tabIndex = 0; s.setAttribute("role", "slider"); s.setAttribute("aria-label", lab.textContent);
         s.innerHTML = '<div class="rail"></div><div class="fill"></div><div class="thumb"></div>';
-        var lab = document.createElement("div"); lab.className = "label"; lab.textContent = (labelText && labelText !== "-") ? labelText : ("Macro " + (i + 1));
         var valEl = document.createElement("div"); valEl.className = "value";
-        el.appendChild(s); el.appendChild(lab); el.appendChild(valEl);
+        el.appendChild(lab); el.appendChild(s); el.appendChild(valEl);
         var cur = 0;
-        function paint() { var n = C.val(key); cur = n === null ? 0 : n; s.querySelector(".thumb").style.bottom = (cur * 100) + "%"; s.querySelector(".fill").style.height = (cur * 100) + "%"; valEl.textContent = Math.round(cur * 100) + " %"; s.setAttribute("aria-valuenow", Math.round(cur * 100)); }
-        bindDrag(s, { get: function () { return cur; }, set: function (n) { C.setMacro(i, n); paint(); }, axis: "y", pixels: 220, label: function () { return lab.textContent; }, text: function () { return Math.round(cur * 100) + " %"; }, onDoubleTap: function () { C.setMacro(i, 0); paint(); } });
+        function paint() { var n = C.val(key); cur = n === null ? 0 : n; s.querySelector(".thumb").style.left = (cur * 100) + "%"; s.querySelector(".fill").style.width = (cur * 100) + "%"; valEl.textContent = Math.round(cur * 100) + " %"; s.setAttribute("aria-valuenow", Math.round(cur * 100)); }
+        bindDrag(s, { get: function () { return cur; }, set: function (n) { C.setMacro(i, n); paint(); }, axis: "x", pixels: 300, label: function () { return lab.textContent; }, text: function () { return Math.round(cur * 100) + " %"; }, onDoubleTap: function () { C.setMacro(i, 0); paint(); } });
         paint();
-        return { el: el, key: key, paint: paint, setLabel: function (t) { lab.textContent = (t && t !== "-") ? t : ("Macro " + (i + 1)); } };
+        return { el: el, key: key, paint: paint, setLabel: function (t) { lab.textContent = (t && t !== "-") ? t : ("Macro " + (i + 1)); s.setAttribute("aria-label", lab.textContent); } };
     }
 
     /* ---- choice: segmented for a few options, a sheet for many ----------------------------- */
     function choice(key, opts) {
         opts = opts || {};
         var p = S.byKey[key];
-        var el = document.createElement("div"); el.className = "cell choice-cell" + (opts.cls ? " " + opts.cls : "");
-        var lab = document.createElement("div"); lab.className = "label"; lab.textContent = opts.label || (p ? p.s : key);
-        el.appendChild(lab);
-        var body = document.createElement("div"); body.className = "choice"; el.appendChild(body);
+        var sh = shell("choice-cell" + (opts.cls ? " " + opts.cls : ""), opts.label || (p ? p.s : key));
+        var el = sh.el, lab = sh.lab;
+        var body = document.createElement("div"); body.className = "choice"; sh.ctl.appendChild(body);
         function options() { return (p && p.o) ? p.o : []; }
         function current() { var n = C.val(key); return p && n !== null ? FMT.natural(p, n) - p.min : -1; }
         function build() {
             body.innerHTML = "";
             var o = options();
-            if (o.length && o.length <= (opts.maxSeg || 5)) {
-                /* chips wrap; a segmented strip stays on one line */
+            /* a segmented strip only when there are few options AND their words are
+             * short enough to sit side by side; chips wrap; everything else is a menu */
+            var words = o.join("").length;
+            var seg = o.length && o.length <= (opts.maxSeg || 5) && (opts.chips || words <= 28);
+            el.classList.remove("seg-cell", "seg2-cell", "pick-cell", "chips-cell");
+            el.classList.add(seg ? (opts.chips ? "chips-cell" : (o.length <= 2 ? "seg2-cell" : "seg-cell")) : "pick-cell");
+            if (seg) {
                 body.className = "choice " + (opts.chips ? "chips" : "seg"); body.setAttribute("role", "radiogroup");
                 o.forEach(function (name, i) {
                     var b = document.createElement("button"); b.type = "button"; b.setAttribute("role", "radio");
@@ -331,14 +350,14 @@
     function toggle(key, opts) {
         opts = opts || {};
         var p = S.byKey[key];
-        var el = document.createElement("div"); el.className = "cell toggle-cell" + (opts.cls ? " " + opts.cls : "");
+        var sh = shell("toggle-cell" + (opts.cls ? " " + opts.cls : ""), opts.label || (p ? p.s : key));
+        var el = sh.el, lab = sh.lab;
         var b = document.createElement("button"); b.type = "button"; b.className = "toggle"; b.setAttribute("role", "switch"); b.setAttribute("aria-checked", "false");
-        b.innerHTML = '<span class="knb"></span>';
-        var lab = document.createElement("div"); lab.className = "label"; lab.textContent = opts.label || (p ? p.s : key);
-        el.appendChild(b); el.appendChild(lab);
+        b.innerHTML = '<span class="knb"></span>'; b.setAttribute("aria-label", lab.textContent);
+        sh.ctl.appendChild(b);
         function on() { var n = C.val(key); return n !== null && n > 0.5; }
         b.addEventListener("click", function () { C.setNorm(key, on() ? 0 : 1); paint(); });
-        function paint() { b.setAttribute("aria-checked", String(on())); el.classList.toggle("pending", !!S.pending[key]); }
+        function paint() { b.setAttribute("aria-checked", String(on())); sh.val.textContent = C.val(key) === null ? "--" : (p && p.o ? C.text(key) : (on() ? "On" : "Off")); el.classList.toggle("pending", !!S.pending[key]); }
         paint();
         return { el: el, key: key, paint: paint, rebind: function () { p = S.byKey[key]; lab.textContent = opts.label || (p ? p.s : key); paint(); } };
     }
@@ -518,6 +537,6 @@
 
     W.knob = knob; W.slider = slider; W.macro = macro; W.choice = choice; W.toggle = toggle; W.auto = auto;
     W.xypad = xypad; W.envelope = envelope; W.scope = scope; W.pickSheet = pickSheet; W.valueSheet = valueSheet;
-    W.FINE = FINE; W.bindDrag = bindDrag; W.hideBubble = hideBubble;
+    W.FINE = FINE; W.bindDrag = bindDrag; W.hideBubble = hideBubble; W.shell = shell;
     root.SurgeWidgets = W;
 })(window);

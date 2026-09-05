@@ -30,6 +30,21 @@ pictures are Surge's own, not drawings of what Surge might do:
   tempo-synced note lengths -- because the page ports `Parameter::get_display`
   and is fed each parameter's own display description.
 
+**Every control sits in the same cell.** A cell is a two-line label, a control
+box of fixed height and a one-line value, and a section's controls are laid in a
+grid of equal columns: knobs in one row therefore sit exactly under knobs in the
+next whatever their labels wrap to, switches and menus share the row's baseline,
+and a menu takes two columns, a segmented strip three (two when it has two
+options). A segmented strip is only offered when its words are short enough to
+sit side by side; otherwise the same parameter is a menu that opens a searchable
+sheet. Macros are eight wide horizontal faders, one per row, label left and value
+right, so nothing ever sits over a word. In the FX tab the sixteen slots are four
+uniform cards per row -- name and type -- and each ACTIVE slot gets a full-width
+strip under its row with its twelve controls in a line. (The first cut had
+flex-wrapped cells of different widths and vertical macro faders whose thumbs
+covered their labels; on the iPad the controls did not line up and the
+modulation slots overlapped. That is the layout this replaced.)
+
 Touch: 44 px minimum targets; drags are relative and never jump; a value bubble
 sits above the finger; a second finger held anywhere (or the Fine switch) turns
 any drag fine; double-tap resets to Surge's default; long-press types a value.
