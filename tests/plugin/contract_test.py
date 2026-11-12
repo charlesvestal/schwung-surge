@@ -75,11 +75,14 @@ def diff_values(a, b, keys):
     return [(k, a.get(k), b.get(k)) for k in keys if not same(a.get(k), b.get(k))]
 
 os.makedirs(A.work, exist_ok=True)
+# The plugin builds its files a slice per rendered block, so a check that reads
+# them renders ~3 s of audio first: on a Move's A72 the first full rebuild takes
+# 1.5-2 s of audio (on Apple Silicon a few hundred ms).
 
 # ---- discovery: the preset, its types, and the parameter table ----------------
 PRESET = 200
 md = moddir("discover")
-run(A.so, md, "create:A", "set:preset=%d" % PRESET, "render:300", "sleep:1200", "state:" + w("s_fresh.json"))
+run(A.so, md, "create:A", "set:preset=%d" % PRESET, "render:3000", "sleep:1200", "state:" + w("s_fresh.json"))
 fresh = json.load(open(w("s_fresh.json")))
 pp = json.load(open(os.path.join(md, "remote", str(fresh["rid"]), "patch_params.json")))
 P = {p["k"]: p for p in pp["params"]}
@@ -99,7 +102,7 @@ print("preset %d %r: fx0 %s -> %s, osc1 %s -> %s" % (PRESET, pp["preset_name"], 
 # the retyped units' ranges, from a run that makes the same switches
 md = moddir("discover2")
 run(A.so, md, "create:A", "set:preset=%d" % PRESET, "render:300", "set:fx0_type=" + FX, "set:osc1_type=" + OSC,
-    "render:300", "sleep:1200")
+    "render:3000", "sleep:1200")
 P2 = {p["k"]: p for p in json.load(open(os.path.join(md, "remote", "0", "patch_params.json")))["params"]}
 
 def natural(p, n):
@@ -167,7 +170,7 @@ if A.ref:
 # or a refusal; never a cut-off blob
 md = moddir("overflow")
 on = ["set:fx%d_type=%s" % (s, FX) for s in range(16)]
-lines, _ = run(A.so, md, "create:A", "set:preset=%d" % PRESET, "render:200", *on, "render:200", "sleep:1500")
+lines, _ = run(A.so, md, "create:A", "set:preset=%d" % PRESET, "render:200", *on, "render:3000", "sleep:1500")
 PO = {p["k"]: p for p in json.load(open(os.path.join(md, "remote", "0", "patch_params.json")))["params"]}
 moves = []
 for k, p in PO.items():
@@ -189,7 +192,7 @@ check("state-size fits again after a preset load", 0 < sz[w("s_after.json")] < 1
 
 # ---- instances + threads ----------------------------------------------------------------
 md = moddir("two")
-lines, _ = run(A.so, md, "create:A", "create:B", "use:B", "set:preset=300", "render:300", "sleep:1200",
+lines, _ = run(A.so, md, "create:A", "create:B", "use:B", "set:preset=300", "render:3000", "sleep:1200",
                "use:A", "state:" + w("two_A.json"), "use:B", "state:" + w("two_B.json"), "threads",
                "destroy:A", "destroy:B")
 sa, sb = json.load(open(w("two_A.json"))), json.load(open(w("two_B.json")))
