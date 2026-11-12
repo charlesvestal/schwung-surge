@@ -22,10 +22,13 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         echo ""
     fi
 
-    # Regenerate the Remote UI's Surge name tables on the host (the build image
-    # has no python3); the container step only copies the result.
+    # Regenerate the Remote UI's Surge name tables on the host, so the copy in
+    # the tree is the one that ships; the container step only copies it.
     if command -v python3 >/dev/null 2>&1; then
         python3 "$REPO_ROOT/src/tools/gen_surge_meta.py"
+    else
+        echo "WARNING: python3 not found; src/remote/assets/surge-meta.js NOT regenerated."
+        echo "         The committed copy is used, and may not match the pinned Surge sources."
     fi
 
     # Run build inside container

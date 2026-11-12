@@ -71,44 +71,75 @@ The page sees the module only through Schwung Manager, which hands a browser
 two things, both from inside the host's 64 KB parameter buffer: our `state`
 blob flattened one field per key, and `chain_params`. **`chain_params` with
 Scene A alone is already 60.8 KB**, so it is untouched and carries nothing new.
-Everything else is files, written by a worker thread in the plugin to
-`<module_dir>/remote/` and served by the manager's module-assets route:
+Everything else is files the plugin writes to `<module_dir>/remote/<rid>/`,
+served by the manager's module-assets route. `rid` is a small per-instance
+number the state carries: two Surge slots write two directories, and the page
+reads the one its own slot's state names.
 
-- **`state`** now carries every registered parameter -- Scene A with its
-  historical bare keys (`osc1_pitch`), Scene B with Surge's `b_` prefix, global
-  with `g_` (`g_volume`, `g_scenemode`, `g_splitkey`, and the four send
-  returns `g_volume_FX1..4`), the sixteen FX slots as `fx<slot>_type` /
-  `fx<slot>_p<n>` where `<slot>` is Surge's ZERO-based slot index (A1-A4 are
-  0-3, B1-B4 4-7, sends 8-11, global 12-15; Surge's own storage names are
-  one-based, `fx1_p0`) -- plus the eight macros (`macro1`..`macro8`, 0..1).
-  765 parameters, about 17 KB. Save and restore are therefore complete for the
-  first time; old states still restore, because Scene A keys and the registry
-  ORDER (which mod-slot destinations index) are unchanged. Surge's global
+- **`state`** carries the preset (name and display index), the module fields,
+  the six mod slots, and **every parameter and macro whose value differs from
+  the loaded preset** -- Scene A with its historical bare keys (`osc1_pitch`),
+  Scene B with Surge's `b_` prefix, global with `g_` (`g_volume`,
+  `g_scenemode`, `g_splitkey`, the send returns `g_volume_FX1..4`), the sixteen
+  FX slots as `fx<slot>_type` / `fx<slot>_p<n>` where `<slot>` is Surge's
+  ZERO-based slot index (A1-A4 are 0-3, B1-B4 4-7, sends 8-11, global 12-15;
+  Surge's own storage names are one-based, `fx1_p0`), and the macros
+  (`macro1`..`macro8`, 0..1, the macro's TARGET, not its smoothed output).
+  `"sparse":1` marks it: a key it does not carry is at the preset's value, which
+  `patch_params.json` gives as `pv`. **Why sparse:** the chain host keeps a
+  synth's state in 16 KB (`MAX_SYNTH_STATE_LEN`, schwung `chain_internal.h`) and
+  drops a larger one, edits and all; every parameter at once was 25 KB. A
+  freshly loaded preset's state is ~600 bytes; 545 parameters moved with all
+  sixteen FX slots on is 14.6 KB. A state that still does not fit is refused
+  (-1), never truncated. One exception to "only what differs": where an
+  oscillator, FX slot, filter or LFO has a different TYPE from the preset's,
+  every parameter of that unit is written, because the restore's type switch
+  resets the unit to the new type's defaults. A restore loads the preset, sets
+  the types, runs Surge's deferred type switches itself (`loadOscalgos`,
+  `loadFx` -- Surge would run them from the next `process()` and reset the
+  values set beside them), then the values, then the mod slots. States saved by
+  the current release (every Scene A key) still restore. Surge's global
   `fx_disable` bitmask (`ct_none`, range INT_MIN..INT_MAX) is deliberately not
   registered: it is not a control, and walking that range as options is what
   crashed the first build.
 - **`patch_params.json`**: every parameter's key, full and short name, scene,
-  control group, control type, value type, range, default, bipolarity, extend /
-  tempo-sync / absolute / deactivate flags and states, and Surge's `displayInfo`
-  verbatim; every option text for integer parameters; a 65-point table of
-  Surge's own text for the few float types it formats by hand; five reference
-  strings (`chk`) for every other float; the macro labels, the wavetable names,
-  and the patch's modulation routings with their depths. Rewritten after every
-  preset load and after any type change (oscillator, filter, waveshaper, LFO,
-  FX types rename and retype their dependants -- and Surge applies the switch on
-  the audio thread, so the registry is re-populated on the worker a beat later).
+  control group, control type, value type, range, default, the preset's value
+  (`pv`), bipolarity, extend / tempo-sync / absolute / deactivate flags and
+  states, and Surge's `displayInfo` verbatim; every option text for integer
+  parameters; a 65-point table of Surge's own text for the few float types it
+  formats by hand; five reference strings (`chk`) for every other float; the
+  macro labels and preset values, the wavetable names, and the patch's
+  modulation routings with their depths. Rebuilt after every preset load and
+  after any type change (oscillator, filter, waveshaper, LFO, FX types rename
+  and retype their dependants).
 - **`presets_index.json`**: the patch list in display order, grouped by category
   with a factory / third-party / user kind. **`waves.json`**: 512 points per
   oscillator, both scenes. **`filters.json`**: 96 log-spaced dB values per
   filter unit, both scenes, plus the frequency axis.
 
-Requests from the host thread only set bits and poke a condition variable; the
-worker coalesces a burst (a knob drag is dozens) into one write ~150 ms later,
-writes to a temp name and renames. Each file carries a `rev`. The worker lives
-inside Move's process, so every writer runs under `try`/`catch` and
-`patch_params.json` is formatted from a snapshot of the registry taken under the
-lock, not with the lock held: the host's parameter thread takes that lock for
-every `find_param`.
+**Who touches what.** Every plugin call arrives on the host's SPI audio
+callback, and only that thread reads Surge. Surge changes its patch there --
+`loadPatch`, a type switch (which deletes the old oscillator or Effect), the
+modulation vectors -- and `process()` holds `storage.modRoutingMutex` every
+block, so another thread can neither read the patch safely nor lock it without
+stalling audio; `get_display` even follows `user_data` into the live Effect.
+So the files are BUILT on the audio thread, a slice per block of at most
+100 us: `patch_params.json` a parameter (or sixteen of its texts) at a time,
+`waves.json` a few oscillator blocks at a time, and four numbers per filter unit
+copied for `filters.json`. Anything that re-shapes the patch mid-build (a preset
+load, a type switch, a MIDI program change, which Surge loads on a thread of its
+own) restarts it. A finished string is handed to a worker by swapping buffers
+reserved up front -- no allocation, no wait. The worker computes the filter
+responses from that copy and writes each file to a temp name and renames it;
+each file carries a `rev`. It runs SCHED_OTHER on cores 0-2 (created with those
+attributes, and it repeats them as its first act: a thread created from
+`create_instance` would otherwise inherit the callback's SCHED_FIFO 70), waits
+on a condition variable rather than sleeping, and checks for shutdown between
+files and filter units, so unloading a slot waits a few milliseconds at most.
+
+After a preset load the files land over the next few hundred milliseconds; on
+an Apple Silicon core the whole rebuild is ~6 ms of audio-thread time, about
+three to four times that on the Move's A72.
 
 **Writes** go through `schwungRemote.setParam` in the units the plugin's
 `set_param` already took: Surge's natural value for floats and plain ints, the
@@ -117,6 +148,22 @@ a destination KEY for mod slots. A preset is `preset` = display index; the
 manager then re-reads the whole state itself, and the page re-reads
 `patch_params.json` until it names the preset the state names.
 
+## Testing the plugin's contract
+
+`scripts/test_plugin.sh` builds `tests/plugin/plugin_ops.cpp` in the build image
+(on Apple Silicon the image is arm64 and runs what it builds) and runs
+`tests/plugin/contract_test.py` against `build/dsp.so`: every plugin call from
+one SCHED_FIFO 70 thread, as the host makes them. It checks the state's size
+(fresh, edited, everything moved, a too-small buffer), a restore whose
+oscillator and FX types differ from the preset's -- through a fresh process,
+compact and pretty-printed as the host writes it, including a value that equals
+the preset's but not the new type's default -- separate files for two live
+instances, and the worker's scheduling policy and CPUs. `--ref <dsp.so>` runs
+the same restore against another build and reports what it does; `--legacy
+<dsp.so>` restores a state saved by that build. `node
+tests/remote/core_test.mjs` checks the page's side: files from
+`remote/<rid>/`, absent keys at `pv`, a whole state resetting what it drops.
+
 ## Verifying the port
 
 `node tests/remote/format_test.mjs tests/remote/fixtures/patch_params.json`
@@ -124,7 +171,8 @@ formats every float parameter at 0, 25, 50, 75 and 100 % with the page's port
 and compares against the five strings Surge wrote into `chk`. A disagreement is
 a bug in the port, never accepted as "close enough". Capture a fixture from a
 running module with the manager's asset route:
-`curl -o tests/remote/fixtures/patch_params.json http://move.local:7700/api/remote-ui/module-assets/surge/remote/patch_params.json`.
+`curl -o tests/remote/fixtures/patch_params.json http://move.local:7700/api/remote-ui/module-assets/surge/remote/0/patch_params.json`
+(`0` is the slot's `rid`, from its state).
 
 ## Testing the plugin without the Move UI
 
@@ -134,7 +182,7 @@ The Move has `gdb`, `gdbserver` and `strace`. The JE-8086 repo's
 under `/data/UserData/jp8000_test/surge/` (dsp.so, module.json, `surge-data`
 symlinked to the real one) it reproduces a load-time crash in seconds, and
 `gdb -q -batch -ex run -ex bt --args ./plugin_host_test ./surge/dsp.so ./surge 4`
-names the frame. It also writes `remote/*.json` into that dir, which is where the
+names the frame. It also writes `remote/<rid>/*.json` into that dir, which is where the
 fixtures in `tests/remote/fixtures/` come from. The harness reports "boot timeout"
 because Surge has no `__status` key; that is not a failure.
 

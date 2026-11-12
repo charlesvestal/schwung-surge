@@ -94,15 +94,41 @@ Design and contract in `docs/REMOTE_UI.md`. The facts that bite:
 
 - **`chain_params` is 60.8 KB of the host's 64 KB parameter buffer with Scene A
   alone.** It carries nothing new; do not add to it. The page's metadata comes
-  from files the plugin's worker thread writes to `<module_dir>/remote/`
-  (`patch_params.json`, `presets_index.json`, `waves.json`, `filters.json`).
-- **`state` carries every parameter now** (Scene B as `b_*`, global as `g_*`,
-  FX as `fx<slot>_type` / `fx<slot>_p<n>`, macros as `macro1..8`). Scene A keys
-  and the registry ORDER are unchanged on purpose: saved mod-slot destinations
-  are registry indices.
-- **Type changes retype their dependants on the audio thread**, so after an
-  oscillator/filter/FX type write the registry is re-populated on the worker
-  ~150 ms later (`RF_REPOP`), never synchronously in `set_param`.
+  from files the plugin writes to `<module_dir>/remote/<rid>/`, one directory
+  per instance (`patch_params.json`, `presets_index.json`, `waves.json`,
+  `filters.json`); `rid` is in the state.
+- **The host keeps 16 KB of a synth's state and DROPS a larger one**
+  (`MAX_SYNTH_STATE_LEN`, schwung `chain_internal.h`): a set reload then loses
+  every edit. So `state` holds only what differs from the loaded preset
+  (`"sparse":1`; the page reads an absent key as `pv` in `patch_params.json`),
+  plus every parameter of a unit whose TYPE differs from the preset's -- the
+  restore's type switch resets that unit. A state that still does not fit is
+  refused (-1), never truncated. Everything at once was 25 KB.
+- **Only the audio thread touches Surge.** Every plugin call arrives on the SPI
+  callback; Surge mutates its patch there (loadPatch, a type switch deletes the
+  old Effect, the modulation vectors) and `process()` holds `modRoutingMutex`
+  every block. `get_display` follows `user_data` into the live Effect, so even
+  a copied Parameter is not safe to format elsewhere. The files are therefore
+  BUILT on the audio thread, in slices of at most 100 us per block
+  (`RemoteBuild`, `remote_service`), and handed to a SCHED_OTHER worker on cores
+  0-2 by swapping pre-reserved buffers; the worker only computes filter
+  responses from a copied POD and writes. The registry is built once in
+  `create_instance` and never re-populated.
+- **A restore sets types first, then runs Surge's deferred switches itself**
+  (`loadOscalgos`, `loadFx`), then the values, then the mod slots. Surge applies
+  an oscillator or FX type from the next `process()` and resets that unit's
+  parameters when it does, so values set in the same pass were lost (16 of them
+  in the contract test, on the build first reviewed).
+- **A thread created from `create_instance` inherits SCHED_FIFO 70** from the
+  callback. Create it with explicit SCHED_OTHER attributes; the worker repeats
+  both as its first act.
+- **`scripts/test_plugin.sh`** runs the plugin in the build image (arm64 Docker on
+  Apple Silicon) from a FIFO 70 thread and checks state size, retype restore,
+  per-instance files and worker policy; `--ref <other dsp.so>` runs the same
+  restore against another build for comparison. For a ThreadSanitizer run use
+  `--security-opt seccomp=unconfined`, and note GCC 11's libtsan does not
+  intercept `pthread_cond_clockwait`: a steady-clock `wait_for` reports a false
+  "double lock".
 - **Surge has a global parameter with the range INT_MIN..INT_MAX** (`fx_disable`,
   an int bitmask, `ct_none`). Its 32-bit span overflowed to -1, passed a
   "< 128 options" check and the option loop ran until `std::bad_alloc` -- inside
