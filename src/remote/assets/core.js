@@ -3,19 +3,24 @@
  * What the page knows and where it comes from:
  *
  *   values      Schwung Manager pushes the module's `state`, flattened, as
- *               `synth:<key>` = normalised 0..1 text for every registered
- *               parameter (both scenes, global, the 16 FX slots) and the
- *               macros, plus preset/preset_name/octave/bpm/mpe fields and the
- *               six mod slots. After any write it re-reads and re-pushes.
- *   metadata    remote/patch_params.json, written by the plugin: every
- *               parameter's key, names, group, control type, range, default and
- *               Surge's displayInfo, the macro labels, wavetable names and the
- *               patch's modulation routings. Rewritten after a preset load or a
- *               type change; carries a rev and the preset name.
- *   presets     remote/presets_index.json, in display order by category.
- *   pictures    remote/waves.json (rendered oscillator cycles) and
- *               remote/filters.json (measured filter responses), rewritten ~150 ms
- *               after the last relevant edit.
+ *               `synth:<key>` = normalised 0..1 text, plus preset/preset_name/
+ *               octave/bpm/mpe fields and the six mod slots. The state holds
+ *               only the parameters and macros that DIFFER from the loaded
+ *               preset (`sparse` = 1; the host keeps 16 KB of it): a key a whole
+ *               push does not carry is at the preset's value, which
+ *               patch_params.json gives as `pv`. A push carrying `sparse` is the
+ *               whole state; a single-key update is not.
+ *   files       under remote/<rid>/, one directory per plugin instance, named
+ *               by the state's `rid` (two Surge slots must not read each
+ *               other's files). A plugin that sends no rid wrote remote/.
+ *   metadata    patch_params.json: every parameter's key, names, group,
+ *               control type, range, default, preset value (`pv`) and Surge's
+ *               displayInfo, the macro labels, wavetable names and the patch's
+ *               modulation routings. Rebuilt after a preset load or a type
+ *               change; carries a rev and the preset name.
+ *   presets     presets_index.json, in display order by category.
+ *   pictures    waves.json (rendered oscillator cycles) and filters.json
+ *               (measured filter responses), rebuilt after a relevant edit.
  *
  * Writes go through schwungRemote.setParam with the value in the form the
  * plugin's set_param takes: Surge's natural units for floats and plain ints,
@@ -29,12 +34,14 @@
     var query = new URLSearchParams(location.search);
     var MODULE_ID = query.get("module") || "surge";
     var ASSETS = "/api/remote-ui/module-assets/" + encodeURIComponent(MODULE_ID) + "/remote/";
+    var rid = null, filesStarted = false;   // this instance's directory under remote/
     var META = root.SURGE_META || {};
     var FMT = root.SurgeFormat;
 
     var S = {
         vals: {},            // key -> normalised number (params, macros) or string (module fields)
         params: null,        // patch_params.json
+        full: null,          // the latest whole (sparse) state push: key -> raw text
         byKey: {},           // key -> param entry
         presets: null,       // presets_index.json
         waves: null, filters: null,
@@ -99,9 +106,13 @@
     var typeChanged = false;
     function onParams(params) {
         var touched = [], presetMoved = false;
+        var whole = Object.prototype.hasOwnProperty.call(params, PFX + "sparse");
+        if (whole) S.full = {};
         for (var full in params) {
             if (!Object.prototype.hasOwnProperty.call(params, full) || full.indexOf(PFX) !== 0) continue;
             var key = full.substring(PFX.length), raw = params[full];
+            if (whole) S.full[key] = raw;
+            if (key === "rid") { ridSeen(raw); continue; }
             var p = S.byKey[key];
             if (p || /^macro[1-8]$/.test(key)) {
                 var n = parseFloat(raw);
@@ -116,6 +127,7 @@
                 touched.push(key);
             }
         }
+        if (whole) touched = touched.concat(applyBase());
         if (!S.connected && touched.length) { S.connected = true; emit("connected"); }
         if (touched.length) emit("values", touched);
         if (presetMoved) { emit("preset", S.vals.preset); expectPatch(); }
@@ -123,22 +135,58 @@
 
     /* ---- files ------------------------------------------------------------------- */
     function fetchJSON(name) {
-        return fetch(ASSETS + name + "?t=" + Date.now(), { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+        var dir = ASSETS + (rid !== null ? rid + "/" : "");
+        return fetch(dir + name + "?t=" + Date.now(), { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+    }
+    /* Values out of the last whole state over the preset's: what the state
+     * carries, else `pv`. A key with one of our writes still landing is left
+     * alone. Returns the keys that moved. */
+    function applyBase() {
+        if (!S.full || !S.params) return [];
+        var moved = [], now = Date.now();
+        function put(k, pv) {
+            var has = Object.prototype.hasOwnProperty.call(S.full, k);
+            var n = has ? parseFloat(S.full[k]) : pv;
+            if (n === undefined || n === null || isNaN(n)) return;
+            if (S.pending[k] && now - S.pending[k] < 600) return;
+            if (S.vals[k] !== n) { S.vals[k] = n; moved.push(k); }
+        }
+        S.params.params.forEach(function (p) { put(p.k, p.pv); });
+        (S.params.macros || []).forEach(function (m) { put(m.key, m.pv); });
+        return moved;
     }
     function indexParams(j) {
         S.params = j; S.byKey = {};
-        j.params.forEach(function (p) { S.byKey[p.k] = p; });
+        j.params.forEach(function (p) {
+            S.byKey[p.k] = p;
+            /* a value that arrived before its parameter was known came in as text */
+            if (typeof S.vals[p.k] === "string") { var n = parseFloat(S.vals[p.k]); if (!isNaN(n)) S.vals[p.k] = n; }
+        });
         S.preset = j.preset; S.presetName = j.preset_name; S.category = j.category;
         S.rev.params = j.rev;
+        return applyBase();
     }
     function loadParams() {
-        return fetchJSON("patch_params.json").then(function (j) { if (j && j.params) { indexParams(j); emit("params", j); } return j; });
+        return fetchJSON("patch_params.json").then(function (j) {
+            if (j && j.params) { var moved = indexParams(j); emit("params", j); if (moved.length) emit("values", moved); }
+            return j;
+        });
+    }
+    function loadAll() { filesStarted = true; loadParams(); loadPresets(); loadWaves(); loadFilters(); }
+    /* the state names this instance's directory; a new one (the slot was
+     * reloaded) means every file is someone else's until re-read */
+    function ridSeen(raw) {
+        var r = parseInt(raw, 10);
+        if (isNaN(r) || r < 0 || (r === rid && filesStarted)) return;   // -1: the plugin writes no files
+        rid = r;
+        loadAll();
     }
     function loadPresets() { return fetchJSON("presets_index.json").then(function (j) { if (j && j.categories) { S.presets = j; emit("presets", j); } return j; }); }
     function loadWaves() { return fetchJSON("waves.json").then(function (j) { if (j && j.scenes) { S.waves = j; emit("waves", j); } return j; }); }
     function loadFilters() { return fetchJSON("filters.json").then(function (j) { if (j && j.scenes) { S.filters = j; emit("filters", j); } return j; }); }
 
-    /* After a preset change the plugin rewrites its files within ~150 ms; the
+    /* After a preset change the plugin rebuilds its files over the next few
+     * hundred ms (it formats them on the audio thread, a slice per block); the
      * page re-reads until patch_params.json names the preset the state names,
      * on a widening schedule, then stops. */
     var expectTimer = null, expectStep = 0;
@@ -157,8 +205,8 @@
     }
 
     /* Oscillator and filter edits change their pictures; the plugin redraws
-     * ~150 ms after the last edit, the page fetches a little after that. A type
-     * change also re-shapes parameters, so the metadata is re-read too. */
+     * them within a few blocks, the page fetches a little after the last edit.
+     * A type change also re-shapes parameters, so the metadata is re-read too. */
     var picTimer = null, picBits = 0;
     function schedulePictures(p) {
         var ctn = ctName(p);
@@ -182,7 +230,9 @@
     /* ---- boot ----------------------------------------------------------------------- */
     function start() {
         if (remote) remote.onParamChange(onParams);
-        loadParams(); loadPresets(); loadWaves(); loadFilters();
+        /* the files wait for the state to name their directory; a plugin that
+         * never does (an older build) wrote them to remote/ itself */
+        setTimeout(function () { if (!filesStarted) loadAll(); }, 1500);
     }
 
     root.SurgeCore = {
