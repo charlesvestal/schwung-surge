@@ -137,9 +137,13 @@ attributes, and it repeats them as its first act: a thread created from
 on a condition variable rather than sleeping, and checks for shutdown between
 files and filter units, so unloading a slot waits a few milliseconds at most.
 
-After a preset load the files land over the next few hundred milliseconds; on
-an Apple Silicon core the whole rebuild is ~6 ms of audio-thread time, about
-three to four times that on the Move's A72.
+Measured on a Move (A72, `plugin_ops` beside a running Move): after a preset
+load `patch_params.json` lands within ~1.5 s and `waves.json` within ~2 s, i.e.
+the rebuild is ~50 ms of audio-thread time spread over ~500 blocks. While it
+runs, a block costs ~100 us more at the median and ~250 us more at p99 (one
+slice overrunning the clock check), against a 2900 us block; outside it,
+nothing. On Apple Silicon the same rebuild is ~6 ms and lands in a few hundred
+ms.
 
 **Writes** go through `schwungRemote.setParam` in the units the plugin's
 `set_param` already took: Surge's natural value for floats and plain ints, the
