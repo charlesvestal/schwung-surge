@@ -64,6 +64,8 @@ typedef plugin_api_v2_t* (*move_plugin_init_v2_fn)(const host_api_v1_t *host);
 #include "SurgeSynthesizer.h"
 #include "SurgeStorage.h"
 #include "Parameter.h"
+#include "SurgeVoice.h" // Pung: a voice's modulated controls (live_mod)
+#include <atomic>
 
 /* Surge block size is 32, Move block size is 128, so we call process() 4 times */
 static_assert(MOVE_FRAMES_PER_BLOCK % BLOCK_SIZE == 0,
@@ -153,6 +155,13 @@ typedef struct {
     double last_clock_time;
     int clock_count;
     double clock_time_sum;
+    /* Pung (https://github.com/rgeissen/push-hack-pung): its ASSIGN screen
+     * (mod_map, mod_set) and live modulation (live_mod). The routed scene
+     * controls the newest voice is read for after each block, lock-free. */
+    int pung_tap_param[32];             /* registry index of a routed control */
+    std::atomic<int> pung_tap_count;
+    std::atomic<float> pung_tap_val[32];
+    std::atomic<int> pung_sounding;
 } surge_instance_t;
 
 /* =====================================================================
@@ -391,6 +400,8 @@ static surge_param_entry* find_param(surge_instance_t *inst, const char *key) {
  * Preset loading
  * ===================================================================== */
 
+static void pung_taps(surge_instance_t *inst); /* (below: Pung's live modulation) */
+
 static void load_preset_by_display_index(surge_instance_t *inst, int display_idx) {
     if (!inst->synth) return;
 
@@ -469,6 +480,195 @@ static void load_preset_by_display_index(surge_instance_t *inst, int display_idx
             }
         }
     }
+    pung_taps(inst); /* Pung: the new sound's routed controls (live_mod) */
+}
+
+/* =====================================================================
+ * Pung: the modulation map, routes, and live modulation
+ * (Pung's ASSIGN screen and live_mod: docs/overrides.md there)
+ * ===================================================================== */
+
+/* the sources a route can start from, in the order a player reaches for
+ * them; src: the modsources number (the slot list's order above) */
+static const struct { int src; const char *id, *name; } kPungSources[] = {
+    {17, "lfo1", "LFO 1"}, {18, "lfo2", "LFO 2"}, {19, "lfo3", "LFO 3"}, {20, "lfo4", "LFO 4"},
+    {16, "filtereg", "Filter EG"}, {15, "ampeg", "Amp EG"}, {1, "velocity", "Velocity"},
+    {6, "modwheel", "Mod Wheel"}, {4, "aftertouch", "Aftertouch"},
+    {7, "macro1", "Macro 1"}, {8, "macro2", "Macro 2"}, {9, "macro3", "Macro 3"}, {10, "macro4", "Macro 4"},
+    {11, "macro5", "Macro 5"}, {12, "macro6", "Macro 6"}, {13, "macro7", "Macro 7"}, {14, "macro8", "Macro 8"},
+    {21, "lfo5", "LFO 5"}, {22, "lfo6", "LFO 6"},
+    {23, "slfo1", "S-LFO 1"}, {24, "slfo2", "S-LFO 2"}, {25, "slfo3", "S-LFO 3"}, {26, "slfo4", "S-LFO 4"},
+    {27, "slfo5", "S-LFO 5"}, {28, "slfo6", "S-LFO 6"},
+    {2, "keytrack", "Keytrack"}, {29, "timbre", "Timbre"}, {30, "releasevelocity", "Release Vel"},
+    {31, "random_bipolar", "Random"}, {32, "random_unipolar", "Random Uni"},
+    {33, "alternate_bipolar", "Alternate"}, {34, "alternate_unipolar", "Alternate Uni"},
+    {5, "pitchbend", "Pitch Bend"}, {3, "polyaftertouch", "Poly AT"}, {35, "breath", "Breath"},
+    {36, "expression", "Expression"}, {37, "sustain", "Sustain"},
+    {38, "lowest_key", "Lowest Key"}, {39, "highest_key", "Highest Key"}, {40, "latest_key", "Latest Key"}};
+static const int kPungNumSources = (int)(sizeof(kPungSources) / sizeof(kPungSources[0]));
+
+/* a registered control's Surge parameter and its tag (nullptr: none) */
+static Parameter *pung_param(surge_instance_t *inst, int i, long *ptag) {
+    long t = inst->params[i].surge_id.getSynthSideId();
+    auto &pp = inst->synth->storage.getPatch().param_ptr;
+    if (t < 0 || t >= (long)pp.size()) return nullptr;
+    if (ptag) *ptag = t;
+    return pp[t];
+}
+
+/* a control a route may reach: modulatable, and a number (not a menu) */
+static bool pung_dest(surge_instance_t *inst, int i) {
+    Parameter *p = pung_param(inst, i, nullptr);
+    return p && p->modulateable && inst->params[i].options_json[0] == '\0';
+}
+
+/* the routed scene controls whose live values the audio thread reads */
+static void pung_taps(surge_instance_t *inst) {
+    int n = 0;
+    inst->pung_tap_count.store(0);
+    for (int i = 0; i < inst->param_count && n < 32; i++) {
+        long t;
+        Parameter *p = pung_param(inst, i, &t);
+        if (!p || !pung_dest(inst, i) || p->scene == 0 || p->valtype != vt_float) continue;
+        for (int k = 0; k < kPungNumSources; k++) {
+            modsources ms = (modsources)kPungSources[k].src;
+            if (inst->synth->isValidModulation(t, ms) && inst->synth->getModDepth01(t, ms, 0, 0) != 0.0f) {
+                inst->pung_tap_param[n++] = i;
+                break;
+            }
+        }
+    }
+    inst->pung_tap_count.store(n);
+}
+
+static void pung_json_str(std::string &j, const char *s) {
+    j += '"';
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') j += '\\';
+        j += *s;
+    }
+    j += '"';
+}
+
+/* get_param("mod_map"): the sources, the controls a route may reach, every route */
+static int pung_mod_map(surge_instance_t *inst, char *buf, int buf_len) {
+    std::string j = "{\"sources\":[";
+    for (int k = 0; k < kPungNumSources; k++) {
+        if (k) j += ",";
+        j += "{\"id\":";
+        pung_json_str(j, kPungSources[k].id);
+        j += ",\"name\":";
+        pung_json_str(j, kPungSources[k].name);
+        j += "}";
+    }
+    j += "],\"dests\":[";
+    bool first = true;
+    for (int i = 0; i < inst->param_count; i++)
+        if (pung_dest(inst, i)) {
+            if (!first) j += ",";
+            pung_json_str(j, inst->params[i].key);
+            first = false;
+        }
+    j += "],\"routes\":[";
+    first = true;
+    char num[48];
+    for (int i = 0; i < inst->param_count; i++) {
+        long t;
+        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
+        for (int k = 0; k < kPungNumSources; k++) {
+            modsources ms = (modsources)kPungSources[k].src;
+            if (!inst->synth->isValidModulation(t, ms)) continue;
+            float d = inst->synth->getModDepth01(t, ms, 0, 0);
+            if (d == 0.0f) continue;
+            if (!first) j += ",";
+            j += "{\"src\":";
+            pung_json_str(j, kPungSources[k].id);
+            j += ",\"dst\":";
+            pung_json_str(j, inst->params[i].key);
+            snprintf(num, sizeof(num), ",\"amount\":%.4f}", d);
+            j += num;
+            first = false;
+        }
+    }
+    j += "]}";
+    int len = (int)j.size();
+    if (len < buf_len) memcpy(buf, j.c_str(), (size_t)len + 1);
+    return len; /* past buf_len: the host asks again with room for it all */
+}
+
+/* set_param("mod_set", {"src","dst","amount"}): a route made, changed, or at 0 removed */
+static void pung_mod_set(surge_instance_t *inst, const char *val) {
+    char src[48], dst[64];
+    float a = 0;
+    if (json_get_string(val, "src", src, sizeof(src)) != 0 || json_get_string(val, "dst", dst, sizeof(dst)) != 0) return;
+    json_get_number(val, "amount", &a);
+    int ms = -1;
+    for (int k = 0; k < kPungNumSources; k++)
+        if (strcmp(src, kPungSources[k].id) == 0) ms = kPungSources[k].src;
+    int pi = -1;
+    for (int i = 0; i < inst->param_count && pi < 0; i++)
+        if (strcmp(inst->params[i].key, dst) == 0) pi = i;
+    long t;
+    if (ms < 0 || pi < 0 || !pung_dest(inst, pi) || !pung_param(inst, pi, &t)) return;
+    if (!inst->synth->isValidModulation(t, (modsources)ms)) return;
+    if (fabsf(a) < 1e-4f)
+        inst->synth->clearModulation(t, (modsources)ms, 0, 0, true);
+    else
+        inst->synth->setModDepth01(t, (modsources)ms, 0, 0, std::max(-1.0f, std::min(1.0f, a)));
+    pung_taps(inst);
+}
+
+/* the state's routes: "mods":[[src,"key",depth],...], every route of the registered controls */
+static int pung_state_mods(surge_instance_t *inst, char *buf, int buf_len) {
+    int off = snprintf(buf, (size_t)buf_len, ",\"mods\":[");
+    bool first = true;
+    for (int i = 0; i < inst->param_count && off < buf_len - 120; i++) {
+        long t;
+        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
+        for (int k = 0; k < kPungNumSources && off < buf_len - 120; k++) {
+            modsources ms = (modsources)kPungSources[k].src;
+            if (!inst->synth->isValidModulation(t, ms)) continue;
+            float d = inst->synth->getModDepth01(t, ms, 0, 0);
+            if (d == 0.0f) continue;
+            off += snprintf(buf + off, (size_t)(buf_len - off), "%s[%d,\"%s\",%.6f]", first ? "" : ",", kPungSources[k].src,
+                            inst->params[i].key, d);
+            first = false;
+        }
+    }
+    off += snprintf(buf + off, (size_t)(buf_len - off), "]");
+    return off;
+}
+
+/* a state's routes over the sound: each registered control's routes made what the state says */
+static void pung_restore_mods(surge_instance_t *inst, const char *val) {
+    const char *m = strstr(val, "\"mods\":[");
+    if (!m) return;
+    m += 8;
+    std::map<std::pair<int, std::string>, float> want;
+    while (*m == '[' || *m == ',') {
+        if (*m == ',') { m++; continue; }
+        int src = 0;
+        char key[64] = "";
+        float d = 0;
+        if (sscanf(m, "[%d,\"%63[^\"]\",%f]", &src, key, &d) == 3) want[{src, key}] = d;
+        const char *e = strchr(m, ']');
+        if (!e) break;
+        m = e + 1;
+    }
+    for (int i = 0; i < inst->param_count; i++) {
+        long t;
+        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
+        for (int k = 0; k < kPungNumSources; k++) {
+            modsources ms = (modsources)kPungSources[k].src;
+            if (!inst->synth->isValidModulation(t, ms)) continue;
+            auto w = want.find({kPungSources[k].src, inst->params[i].key});
+            float target = w == want.end() ? 0.0f : w->second;
+            if (inst->synth->getModDepth01(t, ms, 0, 0) == target) continue;
+            if (target == 0.0f) inst->synth->clearModulation(t, ms, 0, 0, true);
+            else inst->synth->setModDepth01(t, ms, 0, 0, target);
+        }
+    }
+    pung_taps(inst);
 }
 
 /* =====================================================================
@@ -1181,6 +1381,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             }
             if (changed) {
                 apply_slot_to_synth(inst, i);
+                pung_taps(inst);
             }
         }
         if (json_get_number(val, "mpe_enabled", &fval) == 0) {
@@ -1200,6 +1401,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 inst->synth->setParameter01(inst->params[i].surge_id, fval);
             }
         }
+        pung_restore_mods(inst, val); /* Pung: the routes, last (they win over the slots) */
+        return;
+    }
+
+    /* Pung's ASSIGN screen: one route */
+    if (strcmp(key, "mod_set") == 0) {
+        pung_mod_set(inst, val);
         return;
     }
 
@@ -1304,6 +1512,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
 static int v2_get_param(void *instance, const char *key, char *buf, int buf_len) {
     surge_instance_t *inst = (surge_instance_t*)instance;
+    /* Pung's ASSIGN screen (before the "mod_" slot keys, which would take it) */
+    if (inst && inst->synth && strcmp(key, "mod_map") == 0) return pung_mod_map(inst, buf, buf_len);
     if (!inst) return -1;
 
     /* Module-level params */
@@ -1400,6 +1610,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 i, inst->mod_slots[i].dest_idx,
                 i, inst->mod_slots[i].amount);
         }
+        if (offset < buf_len - 200) offset += pung_state_mods(inst, buf + offset, buf_len - offset); /* Pung: the routes */
 
         offset += snprintf(buf + offset, buf_len - offset, "}");
         return offset;
@@ -1415,6 +1626,20 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         int len = strlen(inst->chain_params_json);
         if (len < buf_len) { strcpy(buf, inst->chain_params_json); return len; }
         return -1;
+    }
+
+    /* Pung: the modulation map, and where the sound has its routed controls now */
+    if (strcmp(key, "live_mod") == 0) {
+        int off = snprintf(buf, buf_len, "{");
+        int n = inst->pung_sounding.load() ? inst->pung_tap_count.load() : 0;
+        for (int k = 0; k < n && off < buf_len - 80; k++) {
+            int i = inst->pung_tap_param[k];
+            if (i < 0 || i >= inst->param_count) continue;
+            off += snprintf(buf + off, buf_len - off, "%s\"%s\":%.5f", off > 1 ? "," : "", inst->params[i].key,
+                            inst->pung_tap_val[k].load());
+        }
+        off += snprintf(buf + off, buf_len - off, "}");
+        return off;
     }
 
     /* Generic Surge parameter access */
@@ -1451,6 +1676,21 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         int chunk = (remaining > BLOCK_SIZE) ? BLOCK_SIZE : remaining;
 
         inst->synth->process();
+
+        /* Pung: where the newest voice has its routed controls (live_mod) */
+        {
+            SurgeVoice *nv = nullptr;
+            for (SurgeVoice *v : inst->synth->voices[0])
+                if (!nv || v->age < nv->age) nv = v;
+            inst->pung_sounding.store(nv ? 1 : 0, std::memory_order_relaxed);
+            int n = nv ? inst->pung_tap_count.load(std::memory_order_relaxed) : 0;
+            for (int k = 0; k < n; k++) {
+                long t;
+                Parameter *p = pung_param(inst, inst->pung_tap_param[k], &t);
+                if (p && p->param_id_in_scene >= 0 && p->param_id_in_scene < n_scene_params)
+                    inst->pung_tap_val[k].store(nv->localcopy[p->param_id_in_scene].f, std::memory_order_relaxed);
+            }
+        }
 
         for (int i = 0; i < chunk; i++) {
             float left = inst->synth->output[0][i] * inst->output_gain;
