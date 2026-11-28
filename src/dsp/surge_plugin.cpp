@@ -159,6 +159,7 @@ typedef struct {
      * (mod_map, mod_set) and live modulation (live_mod). The routed scene
      * controls the newest voice is read for after each block, lock-free. */
     int pung_tap_param[32];             /* registry index of a routed control */
+    short pung_of_tag[n_total_params];  /* a Surge parameter's registry index, -1 none */
     std::atomic<int> pung_tap_count;
     std::atomic<float> pung_tap_val[32];
     std::atomic<int> pung_sounding;
@@ -209,6 +210,8 @@ static int json_get_string(const char *json, const char *key, char *out, int out
 /* =====================================================================
  * Parameter registry population
  * ===================================================================== */
+
+static void pung_index(surge_instance_t *inst); /* (below: a control by its Surge tag) */
 
 static void populate_param_registry(surge_instance_t *inst) {
     if (!inst->synth) return;
@@ -281,6 +284,8 @@ static void populate_param_registry(surge_instance_t *inst) {
 
         inst->param_count++;
     }
+
+    pung_index(inst);
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Registered %d Scene A parameters", inst->param_count);
@@ -522,78 +527,159 @@ static bool pung_dest(surge_instance_t *inst, int i) {
     return p && p->modulateable && inst->params[i].options_json[0] == '\0';
 }
 
+/* a control by its Surge tag: filled whenever the registry is */
+static void pung_index(surge_instance_t *inst) {
+    for (int t = 0; t < n_total_params; t++) inst->pung_of_tag[t] = -1;
+    for (int i = 0; i < inst->param_count; i++) {
+        long t = inst->params[i].surge_id.getSynthSideId();
+        if (t >= 0 && t < n_total_params) inst->pung_of_tag[t] = (short)i;
+    }
+}
+
+/* One route of the sound as these keys name it: a registered control, a
+ * source of the list above, and its depth on Surge's own 0..1 scale. */
+struct pung_route {
+    short param, k;
+    float amount;
+};
+#define PUNG_MAX_ROUTES 256
+
+/* Every route of the registered controls, read straight from the sound's
+ * own route lists: as many steps as the sound has routes, and nothing is
+ * allocated, so a read may ask from the audio thread. (Asking Surge for
+ * the depth of every control from every source would be some ten thousand
+ * lookups a read.) Routes past PUNG_MAX_ROUTES are left out. */
+static int pung_routes(surge_instance_t *inst, pung_route *out, int max) {
+    auto &patch = inst->synth->storage.getPatch();
+    int n = 0;
+    for (int L = 0; L < 1 + 2 * n_scenes && n < max; L++) {
+        int sc = L == 0 ? -1 : (L - 1) / 2; /* -1: the routes to global controls */
+        const std::vector<ModulationRouting> &list =
+            sc < 0 ? patch.modulation_global
+                   : ((L - 1) % 2 ? patch.scene[sc].modulation_voice : patch.scene[sc].modulation_scene);
+        for (const ModulationRouting &r : list) {
+            if (n >= max) break;
+            if (r.depth == 0.0f || r.source_index != 0 || (sc < 0 && r.source_scene != 0)) continue;
+            long t = sc < 0 ? r.destination_id : patch.scene_start[sc] + r.destination_id;
+            if (t < 0 || t >= n_total_params || t >= (long)patch.param_ptr.size()) continue;
+            int i = inst->pung_of_tag[t];
+            if (i < 0 || !pung_dest(inst, i)) continue;
+            int k = -1;
+            for (int j = 0; j < kPungNumSources && k < 0; j++)
+                if (kPungSources[j].src == r.source_id) k = j;
+            if (k < 0) continue;
+            float d = patch.param_ptr[t]->get_modulation_f01(r.depth);
+            if (d == 0.0f) continue;
+            out[n].param = (short)i;
+            out[n].k = (short)k;
+            out[n].amount = d;
+            n++;
+        }
+    }
+    return n;
+}
+
 /* the routed scene controls whose live values the audio thread reads */
 static void pung_taps(surge_instance_t *inst) {
-    int n = 0;
+    pung_route r[PUNG_MAX_ROUTES];
+    int nr = pung_routes(inst, r, PUNG_MAX_ROUTES), n = 0;
     inst->pung_tap_count.store(0);
-    for (int i = 0; i < inst->param_count && n < 32; i++) {
-        long t;
-        Parameter *p = pung_param(inst, i, &t);
-        if (!p || !pung_dest(inst, i) || p->scene == 0 || p->valtype != vt_float) continue;
-        for (int k = 0; k < kPungNumSources; k++) {
-            modsources ms = (modsources)kPungSources[k].src;
-            if (inst->synth->isValidModulation(t, ms) && inst->synth->getModDepth01(t, ms, 0, 0) != 0.0f) {
-                inst->pung_tap_param[n++] = i;
-                break;
-            }
-        }
+    for (int a = 0; a < nr && n < 32; a++) {
+        Parameter *p = pung_param(inst, r[a].param, nullptr);
+        if (!p || p->scene == 0 || p->valtype != vt_float) continue;
+        bool have = false;
+        for (int b = 0; b < n && !have; b++) have = inst->pung_tap_param[b] == r[a].param;
+        if (!have) inst->pung_tap_param[n++] = r[a].param;
     }
     inst->pung_tap_count.store(n);
 }
 
-static void pung_json_str(std::string &j, const char *s) {
-    j += '"';
-    for (; *s; s++) {
-        if (*s == '"' || *s == '\\') j += '\\';
-        j += *s;
-    }
-    j += '"';
+/* A text answer written into the caller's buffer: never past it, never cut
+ * inside an entry, and always closed, so what the host reads is whole JSON
+ * however small its buffer. len: what the whole answer takes. */
+struct pung_text {
+    char *buf;
+    int cap, at, len, tail;
+    bool first, cut;
+};
+
+/* tail: the room kept free for what closes the answer after its last entry */
+static void pung_begin(pung_text *t, char *buf, int cap, int tail) {
+    t->buf = buf;
+    t->tail = tail;
+    t->cap = cap > tail ? cap : 0; /* too small for any answer: nothing is written */
+    t->at = t->len = 0;
+    t->first = true;
+    t->cut = false;
+    if (cap > 0) buf[0] = '\0';
 }
 
-/* get_param("mod_map"): the sources, the controls a route may reach, every route */
-static int pung_mod_map(surge_instance_t *inst, char *buf, int buf_len) {
-    std::string j = "{\"sources\":[";
-    for (int k = 0; k < kPungNumSources; k++) {
-        if (k) j += ",";
-        j += "{\"id\":";
-        pung_json_str(j, kPungSources[k].id);
-        j += ",\"name\":";
-        pung_json_str(j, kPungSources[k].name);
-        j += "}";
+/* a piece of the answer's frame: always written (the tail keeps its room) */
+static void pung_frame(pung_text *t, const char *s) {
+    int n = (int)strlen(s);
+    t->len += n;
+    if (t->at + n < t->cap) {
+        memcpy(t->buf + t->at, s, (size_t)n + 1);
+        t->at += n;
     }
-    j += "],\"dests\":[";
-    bool first = true;
+    t->first = true;
+}
+
+/* one entry of a list: written whole, or left out with everything after it */
+static void pung_entry(pung_text *t, const char *s) {
+    int n = (int)strlen(s);
+    int c = t->first ? 0 : 1;
+    t->len += n + c;
+    if (!t->cut && t->at + n + c + t->tail < t->cap) {
+        if (c) t->buf[t->at++] = ',';
+        memcpy(t->buf + t->at, s, (size_t)n + 1);
+        t->at += n;
+    } else {
+        t->cut = true;
+    }
+    t->first = false;
+}
+
+/* What the read returns, as snprintf would: the length of the whole answer,
+ * which is at least the buffer's size when entries were left out. */
+static int pung_end(pung_text *t, int cap) {
+    if (!t->cut && t->cap) return t->at;
+    return t->len >= cap ? t->len : cap;
+}
+
+/* get_param("mod_map"): the sources, the controls a route may reach, every
+ * route. In a buffer too small for it all: the entries that fit, and
+ * "truncated":true. */
+static int pung_mod_map(surge_instance_t *inst, char *buf, int buf_len) {
+    pung_text t;
+    char e[224];
+    pung_begin(&t, buf, buf_len, 56); /* "{"sources":[" and the three pieces that follow the lists */
+    pung_frame(&t, "{\"sources\":[");
+    for (int k = 0; k < kPungNumSources; k++) {
+        snprintf(e, sizeof(e), "{\"id\":\"%s\",\"name\":\"%s\"}", kPungSources[k].id, kPungSources[k].name);
+        pung_entry(&t, e);
+    }
+    pung_frame(&t, "],\"dests\":[");
     for (int i = 0; i < inst->param_count; i++)
         if (pung_dest(inst, i)) {
-            if (!first) j += ",";
-            pung_json_str(j, inst->params[i].key);
-            first = false;
+            snprintf(e, sizeof(e), "\"%s\"", inst->params[i].key);
+            pung_entry(&t, e);
         }
-    j += "],\"routes\":[";
-    first = true;
-    char num[48];
-    for (int i = 0; i < inst->param_count; i++) {
-        long t;
-        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
-        for (int k = 0; k < kPungNumSources; k++) {
-            modsources ms = (modsources)kPungSources[k].src;
-            if (!inst->synth->isValidModulation(t, ms)) continue;
-            float d = inst->synth->getModDepth01(t, ms, 0, 0);
-            if (d == 0.0f) continue;
-            if (!first) j += ",";
-            j += "{\"src\":";
-            pung_json_str(j, kPungSources[k].id);
-            j += ",\"dst\":";
-            pung_json_str(j, inst->params[i].key);
-            snprintf(num, sizeof(num), ",\"amount\":%.4f}", d);
-            j += num;
-            first = false;
-        }
+    pung_frame(&t, "],\"routes\":[");
+    pung_route r[PUNG_MAX_ROUTES];
+    int nr = pung_routes(inst, r, PUNG_MAX_ROUTES);
+    for (int a = 0; a < nr; a++) {
+        snprintf(e, sizeof(e), "{\"src\":\"%s\",\"dst\":\"%s\",\"amount\":%.4f}", kPungSources[r[a].k].id,
+                 inst->params[r[a].param].key, r[a].amount);
+        pung_entry(&t, e);
     }
-    j += "]}";
-    int len = (int)j.size();
-    if (len < buf_len) memcpy(buf, j.c_str(), (size_t)len + 1);
-    return len; /* past buf_len: the host asks again with room for it all */
+    if (t.cut) {
+        pung_frame(&t, "],\"truncated\":true}");
+        t.len -= (int)strlen(",\"truncated\":true"); /* (the whole answer has no such note) */
+    } else {
+        pung_frame(&t, "]}");
+    }
+    return pung_end(&t, buf_len);
 }
 
 /* set_param("mod_set", {"src","dst","amount"}): a route made, changed, or at 0 removed */
@@ -621,20 +707,11 @@ static void pung_mod_set(surge_instance_t *inst, const char *val) {
 /* the state's routes: "mods":[[src,"key",depth],...], every route of the registered controls */
 static int pung_state_mods(surge_instance_t *inst, char *buf, int buf_len) {
     int off = snprintf(buf, (size_t)buf_len, ",\"mods\":[");
-    bool first = true;
-    for (int i = 0; i < inst->param_count && off < buf_len - 120; i++) {
-        long t;
-        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
-        for (int k = 0; k < kPungNumSources && off < buf_len - 120; k++) {
-            modsources ms = (modsources)kPungSources[k].src;
-            if (!inst->synth->isValidModulation(t, ms)) continue;
-            float d = inst->synth->getModDepth01(t, ms, 0, 0);
-            if (d == 0.0f) continue;
-            off += snprintf(buf + off, (size_t)(buf_len - off), "%s[%d,\"%s\",%.6f]", first ? "" : ",", kPungSources[k].src,
-                            inst->params[i].key, d);
-            first = false;
-        }
-    }
+    pung_route r[PUNG_MAX_ROUTES];
+    int nr = pung_routes(inst, r, PUNG_MAX_ROUTES);
+    for (int a = 0; a < nr && off < buf_len - 120; a++)
+        off += snprintf(buf + off, (size_t)(buf_len - off), "%s[%d,\"%s\",%.6f]", a ? "," : "", kPungSources[r[a].k].src,
+                        inst->params[r[a].param].key, r[a].amount);
     off += snprintf(buf + off, (size_t)(buf_len - off), "]");
     return off;
 }
@@ -644,29 +721,52 @@ static void pung_restore_mods(surge_instance_t *inst, const char *val) {
     const char *m = strstr(val, "\"mods\":[");
     if (!m) return;
     m += 8;
-    std::map<std::pair<int, std::string>, float> want;
+    pung_route want[PUNG_MAX_ROUTES];
+    int nw = 0;
     while (*m == '[' || *m == ',') {
         if (*m == ',') { m++; continue; }
         int src = 0;
         char key[64] = "";
         float d = 0;
-        if (sscanf(m, "[%d,\"%63[^\"]\",%f]", &src, key, &d) == 3) want[{src, key}] = d;
+        if (sscanf(m, "[%d,\"%63[^\"]\",%f]", &src, key, &d) == 3 && nw < PUNG_MAX_ROUTES) {
+            int k = -1, i = -1;
+            for (int j = 0; j < kPungNumSources && k < 0; j++)
+                if (kPungSources[j].src == src) k = j;
+            for (int j = 0; j < inst->param_count && i < 0; j++)
+                if (strcmp(inst->params[j].key, key) == 0) i = j;
+            if (k >= 0 && i >= 0 && pung_dest(inst, i)) {
+                want[nw].param = (short)i;
+                want[nw].k = (short)k;
+                want[nw].amount = d;
+                nw++;
+            }
+        }
         const char *e = strchr(m, ']');
         if (!e) break;
         m = e + 1;
     }
-    for (int i = 0; i < inst->param_count; i++) {
+    pung_route have[PUNG_MAX_ROUTES];
+    int nh = pung_routes(inst, have, PUNG_MAX_ROUTES);
+    /* a route the state does not name goes */
+    for (int a = 0; a < nh; a++) {
+        bool named = false;
+        for (int b = 0; b < nw && !named; b++) named = want[b].param == have[a].param && want[b].k == have[a].k;
         long t;
-        if (!pung_dest(inst, i) || !pung_param(inst, i, &t)) continue;
-        for (int k = 0; k < kPungNumSources; k++) {
-            modsources ms = (modsources)kPungSources[k].src;
-            if (!inst->synth->isValidModulation(t, ms)) continue;
-            auto w = want.find({kPungSources[k].src, inst->params[i].key});
-            float target = w == want.end() ? 0.0f : w->second;
-            if (inst->synth->getModDepth01(t, ms, 0, 0) == target) continue;
-            if (target == 0.0f) inst->synth->clearModulation(t, ms, 0, 0, true);
-            else inst->synth->setModDepth01(t, ms, 0, 0, target);
-        }
+        if (!named && pung_param(inst, have[a].param, &t))
+            inst->synth->clearModulation(t, (modsources)kPungSources[have[a].k].src, 0, 0, true);
+    }
+    /* and each one it names is as deep as it says */
+    for (int b = 0; b < nw; b++) {
+        long t;
+        if (!pung_param(inst, want[b].param, &t)) continue;
+        modsources ms = (modsources)kPungSources[want[b].k].src;
+        if (!inst->synth->isValidModulation(t, ms)) continue;
+        float cur = 0.0f;
+        for (int a = 0; a < nh; a++)
+            if (have[a].param == want[b].param && have[a].k == want[b].k) cur = have[a].amount;
+        if (cur == want[b].amount) continue;
+        if (want[b].amount == 0.0f) inst->synth->clearModulation(t, ms, 0, 0, true);
+        else inst->synth->setModDepth01(t, ms, 0, 0, want[b].amount);
     }
     pung_taps(inst);
 }
@@ -1628,18 +1728,45 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return -1;
     }
 
-    /* Pung: the modulation map, and where the sound has its routed controls now */
+    /* Pung: where the sound has its routed controls now, every one in one
+     * read. A control that does not fit the buffer is left out. */
     if (strcmp(key, "live_mod") == 0) {
-        int off = snprintf(buf, buf_len, "{");
+        pung_text t;
+        char e[112];
+        pung_begin(&t, buf, buf_len, 2);
+        pung_frame(&t, "{");
         int n = inst->pung_sounding.load() ? inst->pung_tap_count.load() : 0;
-        for (int k = 0; k < n && off < buf_len - 80; k++) {
+        for (int k = 0; k < n; k++) {
             int i = inst->pung_tap_param[k];
             if (i < 0 || i >= inst->param_count) continue;
-            off += snprintf(buf + off, buf_len - off, "%s\"%s\":%.5f", off > 1 ? "," : "", inst->params[i].key,
-                            inst->pung_tap_val[k].load());
+            snprintf(e, sizeof(e), "\"%s\":%.6f", inst->params[i].key, inst->pung_tap_val[k].load());
+            pung_entry(&t, e);
         }
-        off += snprintf(buf + off, buf_len - off, "}");
-        return off;
+        pung_frame(&t, "}");
+        return pung_end(&t, buf_len);
+    }
+
+    /* <key>:effective, as Schwung's hosts ask of a module that moves a value
+     * itself: where the sound has a routed control now (the number live_mod
+     * gives for it), else the control's own value. <key>:base: its own value. */
+    if (const char *sfx = strrchr(key, ':')) {
+        bool eff = strcmp(sfx, ":effective") == 0;
+        if (eff || strcmp(sfx, ":base") == 0) {
+            char plain[96];
+            size_t n = (size_t)(sfx - key);
+            if (n == 0 || n >= sizeof(plain)) return -1;
+            memcpy(plain, key, n);
+            plain[n] = '\0';
+            if (eff && inst->pung_sounding.load()) {
+                int nt = inst->pung_tap_count.load();
+                for (int k = 0; k < nt; k++) {
+                    int i = inst->pung_tap_param[k];
+                    if (i >= 0 && i < inst->param_count && strcmp(inst->params[i].key, plain) == 0)
+                        return snprintf(buf, buf_len, "%.6f", inst->pung_tap_val[k].load());
+                }
+            }
+            return v2_get_param(instance, plain, buf, buf_len);
+        }
     }
 
     /* Generic Surge parameter access */
